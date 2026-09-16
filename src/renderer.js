@@ -42,13 +42,15 @@ export class SpriteRenderer {
       entry.animation.currentTime = expected;
       entry.geometry = geometry;
       entry.playing = false;
+      entry.rate = undefined;
     }
     const animation = entry.animation;
-    if (animation.playbackRate !== rate) animation.updatePlaybackRate(rate);
+    if (entry.rate !== rate) { animation.updatePlaybackRate(rate); entry.rate = rate; }
     const shouldPlay = playing && comment.frozenProgress == null && !hidden;
     // Correct media-clock drift without resampling transform from JavaScript.
     // During normal playback, the compositor owns every intermediate frame.
-    if (!shouldPlay || shouldPlay !== entry.playing || Math.abs(Number(animation.currentTime) - expected) > 100) {
+    const drift = Math.abs(Number(animation.currentTime) - expected);
+    if (shouldPlay !== entry.playing || drift > (shouldPlay ? 100 : 0.5)) {
       animation.currentTime = expected;
       this.metrics.animationSyncs++;
     }

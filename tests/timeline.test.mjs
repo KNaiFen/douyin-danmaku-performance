@@ -39,3 +39,12 @@ test('realtime posts use current time and ID changes retain the same item', () =
   assert.equal(item.raw.id, 'server');
   assert.equal(timeline.ids.has('local'), false);
 });
+
+test('acknowledgement merges an earlier server echo into the local post', () => {
+  const timeline = new Timeline();
+  timeline.update([{ id: 'local', realTime: true, text: 'post' }, { id: 'server', text: 'post' }], true, 10);
+  const local = timeline.ids.get('local');
+  assert.equal(timeline.rename('local', 'server'), true);
+  assert.deepEqual(timeline.items, [local]);
+  assert.equal(timeline.ids.size, 1); assert.equal(local.raw.id, 'server');
+});

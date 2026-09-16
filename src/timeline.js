@@ -36,7 +36,9 @@ export class Timeline {
   }
   rename(oldID, newID) {
     const item = this.ids.get(String(oldID));
-    if (!item || this.ids.has(String(newID))) return false;
+    if (!item) return false;
+    const echoed = this.ids.get(String(newID));
+    if (echoed && echoed !== item) this.items = this.items.filter(value => value !== echoed);
     this.ids.delete(String(oldID));
     item.id = String(newID);
     item.raw.id = newID;

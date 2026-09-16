@@ -40,11 +40,12 @@ export class CanvasDanmu {
     this.dpr = window.devicePixelRatio || 1;
     this.position = 0;
     this.raf = 0;
+    this.timer = 0;
     this.destroyed = false;
     this.inView = true;
     this.lastTime = NaN;
     this._status = 'closed';
-    this.metrics = { frames: 0, drawn: 0, received: 0, seeks: 0, maxFrameMs: 0, frameMs: 0, layoutReads: 0, emojiSprites: 0, spriteUploads: 0, animationSyncs: 0 };
+    this.metrics = { frames: 0, drawn: 0, received: 0, seeks: 0, maxFrameMs: 0, frameMs: 0, layoutReads: 0, emojiSprites: 0, spriteBuilds: 0, spriteUploads: 0, animationSyncs: 0, schedulerCallbacks: 0, budgetYields: 0 };
     this.originalStyle = this.container.getAttribute('style');
     this.hadDanmuClass = this.container.classList.contains('danmu');
     this.container.classList.add('danmu');
@@ -73,14 +74,14 @@ export class CanvasDanmu {
     });
     this.bind(this.video, 'seeking', () => { this.resetFrame(); this.metrics.seeks++; this.cancel(); });
     this.bind(this.video, 'seeked', () => { this.buffering = false; this.resetFrame(); this.wake(); });
-    this.bind(this.video, 'play', () => { if (this._status === 'paused') this._status = 'playing'; this.wake(); });
+    this.bind(this.video, 'play', () => { if (this._status === 'paused') this._status = 'playing'; this.draw(); this.wake(true); });
     this.bind(this.video, 'playing', () => { this.buffering = false; this.wake(); });
     this.bind(this.video, 'canplay', () => { this.buffering = false; this.wake(); });
     this.bind(this.video, 'pause', () => this.pause());
     this.bind(this.video, 'waiting', () => { this.buffering = true; this.cancel(); });
     this.bind(this.video, 'ended', () => this.cancel());
     this.bind(this.video, 'emptied', () => { this.buffering = false; this.clear(); });
-    this.bind(this.video, 'ratechange', () => { this.draw(); this.wake(); });
+    this.bind(this.video, 'ratechange', () => { this.draw(); this.wake(true); });
     this.bind(document, 'visibilitychange', () => {
       if (document.hidden) this.cancel();
       else this.wake();
@@ -128,20 +129,26 @@ export class CanvasDanmu {
   get state() { return { status: this.status, comments: this.main.data, bullets: this.active, displayArea: { width: this.width, height: this.height } }; }
   get containerPos() { return this.container.getBoundingClientRect(); }
   now() { return Number(this.video.currentTime) || 0; }
-  cancel() { cancelAnimationFrame(this.raf); this.raf = 0; this.renderer?.pause(); }
-  wake() {
-    if (this.destroyed || this.raf || this._status !== 'playing' || this.video.paused || this.video.seeking || this.buffering || document.hidden || !this.inView || !this.width || !this.height) return;
-    this.raf = requestAnimationFrame(timestamp => {
-      this.raf = 0;
-      if (!this.renderer || !this.lastTick || timestamp - this.lastTick >= 32) {
-        this.lastTick = timestamp;
-        this.frame();
-      }
+  cancel() { cancelAnimationFrame(this.raf); clearTimeout(this.timer); this.raf = 0; this.timer = 0; this.renderer?.pause(); }
+  wake(immediate = false) {
+    if (immediate) { clearTimeout(this.timer); this.timer = 0; }
+    if (this.destroyed || this.raf || this.timer || this._status !== 'playing' || this.video.paused || this.video.seeking || this.buffering || document.hidden || !this.inView || !this.width || !this.height) return;
+    const tick = () => {
+      this.raf = 0; this.timer = 0;
+      this.metrics.schedulerCallbacks++;
+      this.frame();
       this.wake();
-    });
+    };
+    if (this.renderer) {
+      const nextTime = this.timeline.items[this.position]?.time ?? Infinity;
+      const idle = !this.active.length && this.pendingHead === this.pending.length;
+      const delay = idle ? Math.min(1000, Math.max(32, (nextTime - this.now()) * 1000 / (this.video.playbackRate || 1))) : 32;
+      // Transforms advance independently. Avoid a JS callback at every display refresh.
+      this.timer = setTimeout(tick, immediate ? 0 : delay);
+    } else this.raf = requestAnimationFrame(tick);
   }
   start() { if (this.destroyed || this._status === 'playing') return; this._status = 'playing'; this.frame(); this.wake(); }
-  play() { if (this.destroyed || this._status === 'closed') return; this._status = 'playing'; this.wake(); }
+  play() { if (this.destroyed || this._status === 'closed') return; this._status = 'playing'; this.draw(); this.wake(true); }
   pause() { if (this._status !== 'closed') this._status = 'paused'; this.cancel(); this.draw(); }
   stop() { this._status = 'closed'; this.cancel(); this.resetFrame(); }
   clear() { this.timeline.clear(); this.resetFrame(); }
@@ -150,6 +157,7 @@ export class CanvasDanmu {
     this.active = [];
     this.pending = [];
     this.pendingHead = 0;
+    this.candidate = null;
     this.emitted.clear();
     resetSpace(this.space);
     this.windowStart = this.now();
@@ -161,9 +169,11 @@ export class CanvasDanmu {
   updateComments(comments, replace = true) {
     if (this.destroyed) return;
     this.metrics.received += comments?.length || 0;
+    const nextTime = replace ? Infinity : this.timeline.items[this.position]?.time ?? Infinity;
     this.timeline.update(comments, replace, this.now());
+    this.candidate = null;
     if (replace) { this.pending = []; this.pendingHead = 0; }
-    this.position = lowerBound(this.timeline.items, Math.max(this.windowStart, this.now() - 2));
+    this.position = lowerBound(this.timeline.items, Math.max(this.windowStart, Math.min(nextTime, this.now() - 2)));
     // Priority and realtime comments must still appear when their server offset
     // predates the current seek window (including comments sent while paused).
     for (const raw of comments || []) {
@@ -177,7 +187,7 @@ export class CanvasDanmu {
     const first = comments?.[0];
     if (!this.fontSizeOverride && first?.style?.fontSize) this.fontSize = parseFloat(first.style.fontSize) || this.fontSize;
     if (!this.durationOverrides.has('scroll') && first?.duration) this.duration = this.mediaDuration(first.duration);
-    this.wake();
+    this.wake(true);
   }
   mediaDuration(ms) { return Math.max(1, Number(ms) / 1000 * (this.video.playbackRate || 1)); }
   sendComment(comment) {
@@ -185,28 +195,47 @@ export class CanvasDanmu {
     if (this._status !== 'closed') this.frame();
   }
   removeComment(id) {
+    const nextTime = this.timeline.items[this.position]?.time ?? Infinity;
     this.timeline.remove(id);
+    this.candidate = null;
     this.active = this.active.filter(c => c.id !== String(id));
     this.pending = this.pending.slice(this.pendingHead).filter(c => c.id !== String(id));
     this.pendingHead = 0;
     if (this.hovered?.id === String(id)) this.releaseHover(false);
-    this.position = lowerBound(this.timeline.items, Math.max(this.windowStart, this.now() - 2));
+    this.position = lowerBound(this.timeline.items, Math.max(this.windowStart, Math.min(nextTime, this.now() - 2)));
     this.rebuildSpace();
     this.draw();
   }
   setCommentID(oldID, newID) {
-    if (!this.timeline.rename(oldID, newID)) return;
+    const nextTime = this.timeline.items[this.position]?.time ?? Infinity;
+    const local = this.active.find(c => c.id === String(oldID));
+    this.timeline.rename(oldID, newID);
     if (this.emitted.delete(String(oldID))) this.emitted.add(String(newID));
-    for (const c of this.active) if (c.id === String(oldID)) {
+    for (const c of [...this.active, ...this.pending.slice(this.pendingHead)]) if (c.id === String(oldID)) {
       c.id = String(newID);
+      c.raw.id = newID;
       if (c.el) {
         c.el.id = String(newID);
         c.el.querySelector('[data-danmu-id]')?.setAttribute('data-danmu-id', String(newID));
       }
     }
+    if (local) {
+      if (this.hovered && this.hovered !== local && this.hovered.id === String(newID)) this.releaseHover();
+      this.active = this.active.filter(c => c === local || c.id !== String(newID));
+    }
+    const queued = new Set(this.active.map(c => c.id));
+    this.pending = this.pending.slice(this.pendingHead).filter(c => {
+      if (queued.has(c.id)) return false;
+      queued.add(c.id); return true;
+    });
+    this.pendingHead = 0;
+    this.candidate = null;
+    this.position = lowerBound(this.timeline.items, Math.max(this.windowStart, Math.min(nextTime, this.now() - 2)));
     if (this.freezeId === String(oldID)) this.freezeId = String(newID);
+    this.rebuildSpace(); this.draw();
   }
   setCommentLike(id, like) {
+    this.candidate = null;
     const item = this.timeline.ids.get(String(id));
     if (item) {
       item.raw.like = like;
@@ -263,14 +292,14 @@ export class CanvasDanmu {
   }
   resize() {
     if (this.destroyed) return;
-    const rect = this.container.getBoundingClientRect();
     this.metrics.layoutReads++;
     if (this.dpr !== (window.devicePixelRatio || 1)) {
       this.dpr = window.devicePixelRatio || 1;
       this.spriteCache.clear(); this.cacheBytes = 0;
     }
-    this.width = rect.width;
-    this.height = rect.height;
+    const previousHeight = this.renderHeight;
+    this.width = this.container.clientWidth;
+    this.height = this.container.clientHeight;
     const area = this.config.area;
     this.top = Math.max(0, Math.min(1, area.start || 0)) * this.height;
     this.renderHeight = area.lines > 0 ? Math.min(this.height - this.top, area.lines * this.channelSize) : Math.max(0, this.height * Math.min(1, area.end ?? 1) - this.top);
@@ -284,7 +313,7 @@ export class CanvasDanmu {
       this.stage.style.height = `${this.renderHeight}px`;
     }
     if (this.windowStart == null) this.resetFrame();
-    else this.reflow();
+    else this.reflow(previousHeight);
     this.emit('channel_resize');
     this.wake();
   }
@@ -301,6 +330,7 @@ export class CanvasDanmu {
     if (cached) { this.spriteCache.delete(key); this.spriteCache.set(key, cached); return cached; }
     const style2d = { font: `400 ${fontSize}px "PingFang SC", "Microsoft YaHei", sans-serif`, fillStyle: style.color || '#fff', strokeStyle: '#000', lineWidth: 2, textBaseline: 'middle' };
     cached = { ...drawRichSprite(parts, style2d, fontSize, this.emojiImages, this.channelSize, decorations), fontSize };
+    this.metrics.spriteBuilds++;
     if (rich) this.metrics.emojiSprites++;
     while (this.cacheBytes + cached.bytes > 16 * 1024 * 1024 && this.spriteCache.size) {
       const oldest = this.spriteCache.keys().next().value;
@@ -312,6 +342,7 @@ export class CanvasDanmu {
   }
 
   refreshEmoji() {
+    this.candidate = null;
     let resized = false;
     for (const c of this.active) {
       if (c.rich && c.imageVersion !== this.emojiImages.version) {
@@ -338,34 +369,46 @@ export class CanvasDanmu {
     }
     for (const lane of Object.values(this.space)) lane.sort((a, b) => a.range - b.range);
   }
-  overlapsDuringFlight(candidate) {
-    const time = this.now();
-    for (const other of this.active) {
+  xAt(c, time = this.now()) {
+    const progress = this.progress(c, time);
+    return c.mode === 'rtl' ? this.width - (this.width + c.width) * progress : c.mode === 'ltr' ? (this.width + c.width) * progress - c.width : (this.width - c.width) / 2;
+  }
+  overlapsDuringFlight(candidate, active = this.active, time = this.now()) {
+    const velocity = c => c.frozenProgress != null || !['rtl', 'ltr'].includes(c.mode) ? 0 : (c.mode === 'rtl' ? -1 : 1) * (this.width + c.width) / c.duration;
+    const remaining = c => c.frozenProgress != null ? Infinity : Math.max(0, c.duration * (1 - this.progress(c, time)));
+    for (const other of active) {
       if (other.mode !== candidate.mode || other.y + other.height <= candidate.y || candidate.y + candidate.height <= other.y) continue;
-      if (other.frozenProgress != null) return true;
-      const remaining = Math.max(0, other.duration * (1 - this.progress(other, time)));
-      if (remaining === 0) continue;
-      if (candidate.mode === 'top' || candidate.mode === 'bottom') return true;
-      const elapsed = (time - other.time) * (this.width + other.width) / other.duration;
-      const tail = this.width + other.width - elapsed;
-      const velocity = (this.width + candidate.width) / candidate.duration;
-      // The upstream allocator assumes equal durations. For a slower leader,
-      // verify both ends of the interval before accepting its proposed lane.
-      if (tail > this.width || remaining > this.width / velocity) return true;
+      const lifetime = Math.min(remaining(candidate), remaining(other));
+      if (lifetime <= 0) continue;
+      const gap = this.xAt(candidate, time) - this.xAt(other, time);
+      const relativeSpeed = velocity(candidate) - velocity(other);
+      const endGap = relativeSpeed === 0 ? gap : gap + relativeSpeed * lifetime;
+      // Relative motion is linear, so its swept interval catches both overlap now
+      // and a faster follower catching the leader before either leaves the screen.
+      if (Math.max(gap, endGap) > -candidate.width + 0.01 && Math.min(gap, endGap) < other.width - 0.01) return true;
     }
     return false;
   }
-  reflow() {
+  reflow(previousHeight = this.renderHeight) {
     if (!this.stage) return;
+    this.candidate = null;
     this.releaseHover();
     const kept = [];
     const overflow = [];
     for (const c of this.active) {
       const oldHeight = c.height;
+      const edge = c.mode === 'bottom' ? previousHeight - c.y - oldHeight : c.y;
       Object.assign(c, this.sprite(c));
-      c.y = Math.round(c.y / oldHeight) * c.height;
-      if (c.y + c.height <= this.renderHeight) kept.push(c);
-      else overflow.push(c);
+      const preferred = Math.round(edge / oldHeight);
+      const rows = Math.floor(this.renderHeight / c.height);
+      let placed = false;
+      for (let attempt = 0; attempt <= rows; attempt++) {
+        const row = attempt === 0 ? preferred : attempt - 1;
+        if (row < 0 || row >= rows || (attempt && row === preferred)) continue;
+        c.y = c.mode === 'bottom' ? this.renderHeight - (row + 1) * c.height : row * c.height;
+        if (!this.overlapsDuringFlight(c, kept)) { kept.push(c); placed = true; break; }
+      }
+      if (!placed) overflow.push(c);
     }
     this.active = kept;
     this.pending = [...overflow, ...this.pending.slice(this.pendingHead)];
@@ -377,6 +420,7 @@ export class CanvasDanmu {
   frame() {
     if (this.destroyed) return;
     const begin = performance.now();
+    const deadline = begin + 4;
     const time = this.now();
     if (Number.isFinite(this.lastTime) && time < this.lastTime) this.resetFrame();
     this.lastTime = time;
@@ -389,6 +433,7 @@ export class CanvasDanmu {
     else if (this.freezeId) this.rebuildSpace();
     const items = this.timeline.items;
     while (this.position < items.length && items[this.position].time <= time) {
+      if (this.position % 64 === 0 && performance.now() >= deadline) { this.metrics.budgetYields++; break; }
       const item = items[this.position++];
       if (this.emitted.has(item.id)) continue;
       this.emitted.add(item.id);
@@ -396,10 +441,13 @@ export class CanvasDanmu {
       this.pending.push(item);
     }
     while (this.pendingHead < this.pending.length) {
+      if (performance.now() >= deadline) { this.metrics.budgetYields++; break; }
       const item = this.pending[this.pendingHead];
       if (this.isHidden(item)) { this.pendingHead++; continue; }
       const mode = item.raw.mode || 'scroll';
-      const c = { ...item, ...this.sprite(item), mode: mode === 'scroll' ? (this.config.direction === 'l2r' ? 'ltr' : 'rtl') : mode };
+      if (this.candidate?.item !== item) this.candidate = { item, comment: { ...item, ...this.sprite(item) } };
+      const c = this.candidate.comment;
+      c.mode = mode === 'scroll' ? (this.config.direction === 'l2r' ? 'ltr' : 'rtl') : mode;
       if (!['rtl', 'ltr', 'top', 'bottom'].includes(c.mode)) c.mode = 'rtl';
       c.time = time;
       c.duration = this.durationOverrides.get(mode) || (item.raw.duration ? this.mediaDuration(item.raw.duration) : this.duration);
@@ -409,11 +457,13 @@ export class CanvasDanmu {
       // queued until a lane opens; seeking explicitly discards the old-time queue.
       c.y = allocate.call({ media: { currentTime: time, playbackRate: 1 }, _: { width: this.width, height: 1e9, duration: c.duration, space: this.space } }, c);
       if (c.mode === 'bottom') c.y = 1e9 - c.height - c.y;
-      if (!this.renderHeight || c.y + c.height > Math.max(c.height, this.renderHeight) || this.overlapsDuringFlight(c)) {
+      const fits = this.renderHeight && c.y + c.height <= Math.max(c.height, this.renderHeight);
+      if (c.mode === 'bottom') c.y = this.renderHeight - c.height - c.y;
+      if (!fits || this.overlapsDuringFlight(c)) {
         this.space[c.mode] = oldSpace;
         break;
       }
-      if (c.mode === 'bottom') c.y = this.renderHeight - c.height - c.y;
+      this.candidate = null;
       this.pendingHead++;
       this.active.push(c);
       this.emit('bullet_start', c);
@@ -435,7 +485,7 @@ export class CanvasDanmu {
     const playing = this._status === 'playing' && !this.video.paused && !this.video.seeking && !this.buffering && this.inView && !document.hidden;
     for (const c of this.active) {
       const progress = this.progress(c, time);
-      c.x = c.mode === 'rtl' ? this.width - (this.width + c.width) * progress : c.mode === 'ltr' ? (this.width + c.width) * progress - c.width : (this.width - c.width) / 2;
+      c.x = this.xAt(c, time);
       if (this.renderer) {
         this.renderer.render(c, this.width, progress, playing, this.video.playbackRate || 1, c === this.hovered);
         continue;
@@ -457,11 +507,12 @@ export class CanvasDanmu {
     }
     if (event.buttons) return;
     const rect = this.container.getBoundingClientRect();
-    const x = event.clientX - rect.left;
-    const y = event.clientY - rect.top - this.top;
+    const scaleX = rect.width / this.width || 1;
+    const scaleY = rect.height / this.height || 1;
+    const x = (event.clientX - rect.left) / scaleX;
+    const y = (event.clientY - rect.top) / scaleY - this.top;
     for (const c of this.active) {
-      const progress = this.progress(c);
-      c.x = c.mode === 'rtl' ? this.width - (this.width + c.width) * progress : c.mode === 'ltr' ? (this.width + c.width) * progress - c.width : (this.width - c.width) / 2;
+      c.x = this.xAt(c);
     }
     const c = this.active.findLast(c => x >= c.x && x <= c.x + c.width && y >= c.y && y <= c.y + c.height);
     if (!c) return;
@@ -494,7 +545,7 @@ export class CanvasDanmu {
       finally { this.dispatchingHover = false; }
       // React adds its action buttons on hover; one measurement keeps them
       // inside the player without introducing layout reads during animation.
-      const menuWidth = el.getBoundingClientRect().width;
+      const menuWidth = el.getBoundingClientRect().width / scaleX;
       this.metrics.layoutReads++;
       el.style.left = `${Math.max(0, Math.min(this.width - menuWidth, c.x))}px`;
       this.hoverCheck = requestAnimationFrame(() => { this.hoverCheck = 0; this.checkHoverBounds(); });

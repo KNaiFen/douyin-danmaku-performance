@@ -210,13 +210,13 @@ test('seek drops old backlog, buffering recovers on canplay and destruction clea
     media.seeking = false; media.dispatchEvent(new Event('seeked'));
     engine.updateComments([comment('target', { start: 60000 })], false); engine.frame();
     media.paused = false; engine.play(); media.dispatchEvent(new Event('canplay'));
-    const recovered = !engine.buffering && !!engine.raf;
+    const recovered = !engine.buffering && !!(engine.raf || engine.timer);
     const ids = engine.active.map(c => c.id);
     engine.destroy();
-    return { backlog, recovered, ids, instances: Engine.instances.size, nodes: document.querySelector('#overlay').children.length, raf: engine.raf, bindings: engine.bindings.length };
+    return { backlog, recovered, ids, instances: Engine.instances.size, nodes: document.querySelector('#overlay').children.length, raf: engine.raf, timer: engine.timer, bindings: engine.bindings.length };
   });
   assert.ok(result.backlog > 4000); assert.ok(result.recovered); assert.deepEqual(result.ids, ['target']);
-  assert.equal(result.instances, 0); assert.equal(result.nodes, 0); assert.equal(result.raf, 0); assert.equal(result.bindings, 0);
+  assert.equal(result.instances, 0); assert.equal(result.nodes, 0); assert.equal(result.raf, 0); assert.equal(result.timer, 0); assert.equal(result.bindings, 0);
 });
 
 test('full backlog drains without a fixed comment limit and modes can be toggled independently', async () => {
@@ -426,4 +426,142 @@ test('a main-thread stall does not discard current comments as a false seek', as
     return { same: engine.active[0] === c, time: c.time, progress: engine.progress(c) };
   });
   assert.ok(result.same); assert.equal(result.time, 0); assert.ok(result.progress > 0);
+});
+
+test('bottom comments use screen coordinates when checking occupied rows', async () => {
+  const result = await page.evaluate(() => {
+    engine.setArea({ lines: 2 });
+    seed([comment('a', { mode: 'bottom', duration: 30000 }), comment('b', { mode: 'bottom' }), comment('c', { mode: 'bottom' })]);
+    advance(15);
+    const row = engine.active.filter(c => c.mode === 'bottom');
+    return { ids: row.map(c => c.id), overlap: row.some((c, i) => row.slice(i + 1).some(other => c.y < other.y + other.height && other.y < c.y + c.height)) };
+  });
+  assert.ok(result.ids.includes('a')); assert.equal(result.overlap, false);
+});
+
+test('resizing or enlarging text relocates colliding comments without dropping them', async () => {
+  const result = await page.evaluate(() => {
+    engine.setArea({ lines: 1 }); seed([comment('a'), comment('b')]);
+    advance(3);
+    const before = engine.active.length;
+    document.querySelector('#player').style.width = '240px'; engine.resize();
+    engine.setFontSize(32, 44);
+    const row = engine.active;
+    return { before, retained: row.length + engine.pending.length - engine.pendingHead, overlap: row.some((c, i) => row.slice(i + 1).some(other => c.x < other.x + other.width && other.x < c.x + c.width)) };
+  });
+  assert.equal(result.before, 2); assert.equal(result.retained, 2); assert.equal(result.overlap, false);
+});
+
+test('scaled players keep local layout dimensions and hover at visible text', async () => {
+  await page.evaluate(() => {
+    document.querySelector('#player').style.cssText += ';transform:scale(0.5);transform-origin:top left;';
+    engine.resize(); seed([comment('scaled')]); advance(5);
+  });
+  const point = await page.evaluate(() => {
+    const c = engine.active[0], rect = engine.renderer.entries.get(c).node.getBoundingClientRect();
+    return { x: rect.left + 25, y: rect.top + 8, width: engine.width };
+  });
+  assert.equal(point.width, 1000);
+  await page.mouse.move(point.x, point.y);
+  await page.waitForFunction(() => engine.hovered?.id === 'scaled');
+  await page.mouse.move(20, 210);
+  await page.waitForFunction(() => !engine.hovered);
+});
+
+test('server echo before post acknowledgement does not duplicate a queued comment', async () => {
+  const result = await page.evaluate(() => {
+    engine.setArea({ lines: 1 }); seed([comment('leader')]);
+    engine.sendComment(comment('temporary', { realTime: true, prior: true }));
+    engine.updateComments([comment('server', { prior: true })], false);
+    engine.setCommentID('temporary', 'server');
+    const pending = engine.pending.slice(engine.pendingHead).map(c => c.id);
+    return { pending, timeline: engine.timeline.items.map(c => c.id) };
+  });
+  assert.deepEqual(result.pending, ['server']);
+  assert.deepEqual(result.timeline, ['leader', 'server']);
+});
+
+test('active post can still be renamed after the native business clears main.data', async () => {
+  const result = await page.evaluate(() => {
+    seed([comment('temporary')]); advance(2);
+    engine.main.data = [];
+    engine.setCommentID('temporary', 'server');
+    engine.updateComments([comment('server', { start: 2000 })], false); engine.frame();
+    return { ids: engine.active.map(c => c.id), raw: engine.active[0].raw.id, pending: engine.pending.length - engine.pendingHead };
+  });
+  assert.deepEqual(result.ids, ['server']); assert.equal(result.raw, 'server'); assert.equal(result.pending, 0);
+});
+
+test('blocked comments reuse their measured sprite and burst work yields without losing data', async () => {
+  const result = await page.evaluate(() => {
+    engine.setArea({ lines: 1 }); seed([comment('leader'), comment('waiting')]);
+    let lookups = 0;
+    const sprite = engine.sprite.bind(engine);
+    engine.sprite = item => { lookups++; return sprite(item); };
+    for (let i = 0; i < 100; i++) engine.frame();
+    const blockedLookups = lookups;
+    engine.stop(); engine.clear();
+    engine.updateComments(Array.from({ length: 1000 }, (_, i) => comment(String(i))));
+    const clock = performance.now.bind(performance);
+    let cost = 0;
+    performance.now = () => { cost += 0.5; return cost; };
+    engine.start();
+    const firstQueued = engine.pending.length - engine.pendingHead + engine.active.length;
+    for (let i = 0; i < 100 && engine.position < 1000; i++) engine.frame();
+    performance.now = clock;
+    return { blockedLookups, firstQueued, total: engine.pending.length - engine.pendingHead + engine.active.length, yields: engine.metrics.budgetYields };
+  });
+  assert.equal(result.blockedLookups, 0);
+  assert.ok(result.firstQueued < 1000); assert.equal(result.total, 1000); assert.ok(result.yields > 0);
+});
+
+test('late network batches preserve older unscheduled comments after a budget yield', async () => {
+  const result = await page.evaluate(() => {
+    const data = Array.from({ length: 1000 }, (_, i) => comment(String(i), { start: i * 10 }));
+    seed(data); engine.cancel();
+    media.currentTime = 20;
+    engine.updateComments([comment('late', { start: 20000 })], false);
+    for (let i = 0; i < 10 && engine.position < engine.timeline.items.length; i++) engine.frame();
+    return { seen: engine.emitted.size };
+  });
+  assert.equal(result.seen, 1001);
+});
+
+test('idle scheduling sleeps and incoming data wakes it immediately', async () => {
+  const result = await page.evaluate(async () => {
+    engine.start(); media.paused = false; engine.play();
+    await new Promise(resolve => setTimeout(resolve, 150));
+    const idleCallbacks = engine.metrics.schedulerCallbacks;
+    engine.updateComments([comment('arrived')], false);
+    await new Promise(resolve => setTimeout(resolve, 80));
+    const active = engine.active.map(c => c.id);
+    engine.destroy();
+    return { idleCallbacks, active, timer: engine.timer };
+  });
+  assert.ok(result.idleCallbacks <= 1); assert.deepEqual(result.active, ['arrived']); assert.equal(result.timer, 0);
+});
+
+test('renaming an active post removes an already visible server echo', async () => {
+  const result = await page.evaluate(() => {
+    seed([comment('temporary'), comment('server')]); advance(2);
+    engine.setCommentID('temporary', 'server');
+    return { ids: engine.active.map(c => c.id), nodes: engine.renderer.entries.size };
+  });
+  assert.deepEqual(result.ids, ['server']); assert.equal(result.nodes, 1);
+});
+
+test('rebuilding animation geometry preserves effective playback rate', async () => {
+  const rate = await page.evaluate(async () => {
+    seed([comment('a')]); advance(2);
+    media.playbackRate = 2; media.paused = false; engine.play();
+    let entry = engine.renderer.entries.get(engine.active[0]);
+    await entry.animation.ready;
+    engine.setFontSize(32, 44);
+    entry = engine.renderer.entries.get(engine.active[0]);
+    await entry.animation.ready;
+    const rate = entry.animation.playbackRate;
+    engine.pause();
+    return rate;
+  });
+  assert.equal(rate, 2);
 });
