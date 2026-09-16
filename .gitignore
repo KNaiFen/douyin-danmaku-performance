@@ -1,0 +1,14 @@
+.materials/
+node_modules/
+output/
+.playwright-cli/
+*.log
+test-results/
+playwright-report/
+coverage/
+.env
+.env.*
+!.env.example
+*.har
+*.trace
+*.zip

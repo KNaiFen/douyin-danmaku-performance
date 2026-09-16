@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>弹幕引擎验证</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #151718; color: #f4f4f4; font: 14px system-ui; }
+  #player { width: min(100%, 1100px); aspect-ratio: 16/9; position: relative; margin: 16px auto; background: #29382e; overflow: hidden; }
+  #scene, #overlay { position: absolute; inset: 0; width: 100%; height: 100%; }
+  .danmu { overflow:hidden; }
+  .danmu > * { position:absolute; white-space:nowrap; }
+  #controls { max-width:1100px; margin:auto; display:flex; flex-wrap:wrap; gap:12px; padding:12px; align-items:center; }
+  button, select { font:inherit; padding:8px; }
+  #seek { flex:1; min-width:180px; }
+</style>
+<div id="player"><canvas id="scene"></canvas><div id="overlay"></div></div>
+<div id="controls">
+  <button id="play">暂停</button>
+  <input id="seek" type="range" min="0" max="600" step="0.1" value="0" aria-label="播放进度">
+  <output id="time">0.0</output>
+  <select id="speed" aria-label="播放速度"><option value="1">1x</option><option value="2">2x</option></select>
+  <input id="opacity" type="range" min="0" max="100" step="1" value="100" aria-label="弹幕不透明度">
+  <button id="toggle">关闭弹幕</button>
+  <button id="fullscreen">全屏</button>
+</div>
+<script type="module">
+import { CanvasDanmu } from '/engine.js';
+const params = new URLSearchParams(location.search);
+const media = new EventTarget();
+Object.assign(media, { currentTime: 0, playbackRate: 1, paused: false, seeking: false });
+const overlay = document.querySelector('#overlay');
+let clock = performance.now();
+function tick(now) {
+  if (!media.paused && !media.seeking) media.currentTime += (now - clock) / 1000 * media.playbackRate;
+  clock = now;
+  document.querySelector('#time').value = media.currentTime.toFixed(1);
+  if (!media.seeking) document.querySelector('#seek').value = media.currentTime;
+  requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+const scene = document.querySelector('#scene');
+scene.width=1100; scene.height=619;
+const context=scene.getContext('2d');
+function paint(now) {
+  context.fillStyle='#23312a'; context.fillRect(0,0,1100,619);
+  context.strokeStyle='#526c5b'; context.lineWidth=2;
+  for(let x=0;x<1100;x+=50) { context.beginPath(); context.moveTo(x,0);context.lineTo(x,619);context.stroke(); }
+  for(let y=0;y<619;y+=50) { context.beginPath();context.moveTo(0,y);context.lineTo(1100,y);context.stroke(); }
+  context.fillStyle='#79b6df'; context.fillRect(50+(media.currentTime*50)%900,380,100,100);
+  requestAnimationFrame(paint);
+}requestAnimationFrame(paint);
+let Original;
+if(params.get('engine')==='original') {
+  window.webpackChunkdouyin_web=[];
+  await new Promise((resolve,reject)=>{const script=document.createElement('script');script.src='/original.js';script.onload=resolve;script.onerror=reject;document.head.appendChild(script)});
+  const module={exports:{}};window.webpackChunkdouyin_web[0][1][150486](module);Original=module.exports;
+}
+const count=Number(params.get('count')||3000);
+const texts=['这段很精彩','保持流畅的弹幕','跳转后时间同步','文字与视频一起播放','同一份数据对照','这是第'];
+const data=Array.from({length:count},(_,i)=>({id:String(i),start:i*600000/count,text:texts[i%texts.length]+' '+i,txt:texts[i%texts.length]+' '+i,duration:14400,mode:'scroll',style:{fontSize:'24px',color:'#fff'},elLazyInit:true}));
+const config={container:overlay,player:media,comments:data,defaultOff:true,area:{start:0,end:1},channelSize:34,trackAllocationOptimization:true,textWidthPrediction:true,postOptimization:true,mouseControl:true,hooks:{
+  bulletCreateEl(raw){const node=document.createElement('div');node.textContent=raw.text;node.style.cssText='color:white;font-size:24px;line-height:34px;text-shadow:1px 1px black;';return node},
+  bulletEstimaWidth(text){return text.length*24+32},
+}};
+const engine=new (Original||CanvasDanmu)(config);engine.start();
+Object.assign(window,{engine,media,data});
+document.querySelector('#play').onclick=event=>{media.paused=!media.paused;media.dispatchEvent(new Event(media.paused?'pause':'play'));media.paused?engine.pause():engine.play();event.target.textContent=media.paused?'播放':'暂停'};
+document.querySelector('#seek').oninput=()=>{media.seeking=true;media.currentTime=Number(document.querySelector('#seek').value);media.dispatchEvent(new Event('seeking'));engine.stop()};
+document.querySelector('#seek').onchange=()=>{media.seeking=false;media.dispatchEvent(new Event('seeked'));engine.start();if(media.paused)engine.pause()};
+document.querySelector('#speed').onchange=event=>{media.playbackRate=Number(event.target.value);media.dispatchEvent(new Event('ratechange'));engine.setAllDuration('scroll',14400/media.playbackRate)};
+document.querySelector('#opacity').oninput=event=>engine.setOpacity(Number(event.target.value)/100);
+document.querySelector('#toggle').onclick=event=>{if(engine.status==='closed'){engine.start();event.target.textContent='关闭弹幕'}else{engine.stop();event.target.textContent='开启弹幕'}};
+document.querySelector('#fullscreen').onclick=()=>document.fullscreenElement?document.exitFullscreen():document.querySelector('#player').requestFullscreen();
+</script>
+</html>
