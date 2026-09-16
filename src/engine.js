@@ -3,6 +3,7 @@ import canvasEngine from 'danmaku/src/engine/canvas.js';
 import { resetSpace } from 'danmaku/src/utils.js';
 import { Timeline, lowerBound } from './timeline.js';
 import { splitEmoji, EmojiImages, drawRichSprite } from './emoji.js';
+import { SpriteRenderer } from './renderer.js';
 
 export const instances = new Set();
 
@@ -36,13 +37,14 @@ export class CanvasDanmu {
     this.fontSizeOverride = false;
     this.durationOverrides = new Map();
     this.channelSize = config.channelSize || 32;
+    this.dpr = window.devicePixelRatio || 1;
     this.position = 0;
     this.raf = 0;
     this.destroyed = false;
     this.inView = true;
     this.lastTime = NaN;
     this._status = 'closed';
-    this.metrics = { frames: 0, drawn: 0, received: 0, seeks: 0, maxFrameMs: 0, frameMs: 0, layoutReads: 0, emojiSprites: 0 };
+    this.metrics = { frames: 0, drawn: 0, received: 0, seeks: 0, maxFrameMs: 0, frameMs: 0, layoutReads: 0, emojiSprites: 0, spriteUploads: 0, animationSyncs: 0 };
     this.originalStyle = this.container.getAttribute('style');
     this.hadDanmuClass = this.container.classList.contains('danmu');
     this.container.classList.add('danmu');
@@ -54,6 +56,10 @@ export class CanvasDanmu {
     if (!this.stage.context) { this.host.remove(); throw new Error('Canvas 2D is unavailable'); }
     this.stage.style.cssText = 'position:absolute;left:0;top:0;pointer-events:none;';
     this.host.appendChild(this.stage);
+    if (config.renderer !== 'canvas' && typeof this.stage.animate === 'function') {
+      this.renderer = new SpriteRenderer(this.host, this.metrics);
+      this.stage.style.display = 'none';
+    }
     this.space = {};
     resetSpace(this.space);
     // The site's business module reads these fields and assigns main.data on seek.
@@ -74,7 +80,7 @@ export class CanvasDanmu {
     this.bind(this.video, 'waiting', () => { this.buffering = true; this.cancel(); });
     this.bind(this.video, 'ended', () => this.cancel());
     this.bind(this.video, 'emptied', () => { this.buffering = false; this.clear(); });
-    this.bind(this.video, 'ratechange', () => this.wake());
+    this.bind(this.video, 'ratechange', () => { this.draw(); this.wake(); });
     this.bind(document, 'visibilitychange', () => {
       if (document.hidden) this.cancel();
       else this.wake();
@@ -83,6 +89,7 @@ export class CanvasDanmu {
     this.bind(this.pointerRoot, 'pointermove', event => this.hitTest(event));
     this.bind(this.pointerRoot, 'pointerleave', () => { if (!this.manualFreeze) this.releaseHover(); });
     this.bind(window, 'blur', () => { if (!this.manualFreeze) this.releaseHover(); });
+    this.bind(window, 'resize', () => { if (this.dpr !== (window.devicePixelRatio || 1)) this.resize(); });
     this.resizeObserver = new ResizeObserver(() => this.resize());
     this.resizeObserver.observe(this.container);
     this.intersectionObserver = new IntersectionObserver(entries => {
@@ -121,18 +128,21 @@ export class CanvasDanmu {
   get state() { return { status: this.status, comments: this.main.data, bullets: this.active, displayArea: { width: this.width, height: this.height } }; }
   get containerPos() { return this.container.getBoundingClientRect(); }
   now() { return Number(this.video.currentTime) || 0; }
-  cancel() { cancelAnimationFrame(this.raf); this.raf = 0; }
+  cancel() { cancelAnimationFrame(this.raf); this.raf = 0; this.renderer?.pause(); }
   wake() {
     if (this.destroyed || this.raf || this._status !== 'playing' || this.video.paused || this.video.seeking || this.buffering || document.hidden || !this.inView || !this.width || !this.height) return;
-    this.raf = requestAnimationFrame(() => {
+    this.raf = requestAnimationFrame(timestamp => {
       this.raf = 0;
-      this.frame();
+      if (!this.renderer || !this.lastTick || timestamp - this.lastTick >= 32) {
+        this.lastTick = timestamp;
+        this.frame();
+      }
       this.wake();
     });
   }
   start() { if (this.destroyed || this._status === 'playing') return; this._status = 'playing'; this.frame(); this.wake(); }
   play() { if (this.destroyed || this._status === 'closed') return; this._status = 'playing'; this.wake(); }
-  pause() { if (this._status !== 'closed') this._status = 'paused'; this.cancel(); }
+  pause() { if (this._status !== 'closed') this._status = 'paused'; this.cancel(); this.draw(); }
   stop() { this._status = 'closed'; this.cancel(); this.resetFrame(); }
   clear() { this.timeline.clear(); this.resetFrame(); }
   resetFrame() {
@@ -145,6 +155,7 @@ export class CanvasDanmu {
     this.windowStart = this.now();
     this.position = lowerBound(this.timeline.items, this.windowStart);
     this.lastTime = NaN;
+    this.renderer?.clear();
     canvasEngine.framing(this.stage);
   }
   updateComments(comments, replace = true) {
@@ -254,6 +265,10 @@ export class CanvasDanmu {
     if (this.destroyed) return;
     const rect = this.container.getBoundingClientRect();
     this.metrics.layoutReads++;
+    if (this.dpr !== (window.devicePixelRatio || 1)) {
+      this.dpr = window.devicePixelRatio || 1;
+      this.spriteCache.clear(); this.cacheBytes = 0;
+    }
     this.width = rect.width;
     this.height = rect.height;
     const area = this.config.area;
@@ -261,7 +276,13 @@ export class CanvasDanmu {
     this.renderHeight = area.lines > 0 ? Math.min(this.height - this.top, area.lines * this.channelSize) : Math.max(0, this.height * Math.min(1, area.end ?? 1) - this.top);
     this.host.style.top = `${this.top}px`;
     this.host.style.height = `${this.renderHeight}px`;
-    canvasEngine.resize(this.stage, this.width, this.renderHeight);
+    if (this.renderer) { this.stage.width = 1; this.stage.height = 1; }
+    else {
+      this.stage.width = Math.ceil(this.width * this.dpr);
+      this.stage.height = Math.ceil(this.renderHeight * this.dpr);
+      this.stage.style.width = `${this.width}px`;
+      this.stage.style.height = `${this.renderHeight}px`;
+    }
     if (this.windowStart == null) this.resetFrame();
     else this.reflow();
     this.emit('channel_resize');
@@ -275,7 +296,7 @@ export class CanvasDanmu {
     const parts = splitEmoji(text, this.emojiListMapped);
     const rich = parts.some(part => part.url);
     const decorations = { isDanmuAuthor: !!item.raw.prior && !item.raw._?.isAnchor, ...item.raw._ };
-    const key = JSON.stringify([parts, fontSize, this.channelSize, style.color || '#fff', decorations.isLike, decorations.showDigg, decorations.diggCount, decorations.isDanmuAuthor, decorations.isAnchor, rich ? this.emojiImages.version : 0]);
+    const key = JSON.stringify([parts, fontSize, this.channelSize, this.dpr, style.color || '#fff', decorations.isLike, decorations.showDigg, decorations.diggCount, decorations.isDanmuAuthor, decorations.isAnchor, rich ? this.emojiImages.version : 0]);
     let cached = this.spriteCache.get(key);
     if (cached) { this.spriteCache.delete(key); this.spriteCache.set(key, cached); return cached; }
     const style2d = { font: `400 ${fontSize}px "PingFang SC", "Microsoft YaHei", sans-serif`, fillStyle: style.color || '#fff', strokeStyle: '#000', lineWidth: 2, textBaseline: 'middle' };
@@ -291,13 +312,15 @@ export class CanvasDanmu {
   }
 
   refreshEmoji() {
+    let resized = false;
     for (const c of this.active) {
       if (c.rich && c.imageVersion !== this.emojiImages.version) {
         const next = this.sprite(c);
-        c.canvas = next.canvas;
-        c.imageVersion = next.imageVersion;
+        if (next.width !== c.width) resized = true;
+        Object.assign(c, next);
       }
     }
+    if (resized) this.reflow();
   }
 
   progress(c, time = this.now()) { return c.frozenProgress ?? (time - c.time) / c.duration; }
@@ -314,6 +337,23 @@ export class CanvasDanmu {
       this.space[c.mode].splice(-1, 0, record);
     }
     for (const lane of Object.values(this.space)) lane.sort((a, b) => a.range - b.range);
+  }
+  overlapsDuringFlight(candidate) {
+    const time = this.now();
+    for (const other of this.active) {
+      if (other.mode !== candidate.mode || other.y + other.height <= candidate.y || candidate.y + candidate.height <= other.y) continue;
+      if (other.frozenProgress != null) return true;
+      const remaining = Math.max(0, other.duration * (1 - this.progress(other, time)));
+      if (remaining === 0) continue;
+      if (candidate.mode === 'top' || candidate.mode === 'bottom') return true;
+      const elapsed = (time - other.time) * (this.width + other.width) / other.duration;
+      const tail = this.width + other.width - elapsed;
+      const velocity = (this.width + candidate.width) / candidate.duration;
+      // The upstream allocator assumes equal durations. For a slower leader,
+      // verify both ends of the interval before accepting its proposed lane.
+      if (tail > this.width || remaining > this.width / velocity) return true;
+    }
+    return false;
   }
   reflow() {
     if (!this.stage) return;
@@ -338,7 +378,7 @@ export class CanvasDanmu {
     if (this.destroyed) return;
     const begin = performance.now();
     const time = this.now();
-    if (Number.isFinite(this.lastTime) && (time < this.lastTime || time - this.lastTime > 1)) this.resetFrame();
+    if (Number.isFinite(this.lastTime) && time < this.lastTime) this.resetFrame();
     this.lastTime = time;
     this.active = this.active.filter(c => {
       if (c.frozenProgress != null || this.progress(c, time) <= 1) return true;
@@ -369,7 +409,7 @@ export class CanvasDanmu {
       // queued until a lane opens; seeking explicitly discards the old-time queue.
       c.y = allocate.call({ media: { currentTime: time, playbackRate: 1 }, _: { width: this.width, height: 1e9, duration: c.duration, space: this.space } }, c);
       if (c.mode === 'bottom') c.y = 1e9 - c.height - c.y;
-      if (!this.renderHeight || c.y + c.height > Math.max(c.height, this.renderHeight)) {
+      if (!this.renderHeight || c.y + c.height > Math.max(c.height, this.renderHeight) || this.overlapsDuringFlight(c)) {
         this.space[c.mode] = oldSpace;
         break;
       }
@@ -390,13 +430,19 @@ export class CanvasDanmu {
 
   draw() {
     const time = this.now();
-    canvasEngine.framing(this.stage);
+    if (this.renderer) this.renderer.retain(this.active);
+    else canvasEngine.framing(this.stage);
+    const playing = this._status === 'playing' && !this.video.paused && !this.video.seeking && !this.buffering && this.inView && !document.hidden;
     for (const c of this.active) {
-      if (c === this.hovered) continue;
       const progress = this.progress(c, time);
       c.x = c.mode === 'rtl' ? this.width - (this.width + c.width) * progress : c.mode === 'ltr' ? (this.width + c.width) * progress - c.width : (this.width - c.width) / 2;
+      if (this.renderer) {
+        this.renderer.render(c, this.width, progress, playing, this.video.playbackRate || 1, c === this.hovered);
+        continue;
+      }
+      if (c === this.hovered) continue;
       this.stage.context.globalAlpha = c.raw.style?.opacity == null ? 1 : Math.max(0, Math.min(1, Number(c.raw.style.opacity) || 0));
-      canvasEngine.render(this.stage, c);
+      this.stage.context.drawImage(c.canvas, c.x * this.dpr, c.y * this.dpr, c.width * this.dpr, c.height * this.dpr);
       this.metrics.drawn++;
     }
     this.stage.context.globalAlpha = 1;
@@ -413,6 +459,10 @@ export class CanvasDanmu {
     const rect = this.container.getBoundingClientRect();
     const x = event.clientX - rect.left;
     const y = event.clientY - rect.top - this.top;
+    for (const c of this.active) {
+      const progress = this.progress(c);
+      c.x = c.mode === 'rtl' ? this.width - (this.width + c.width) * progress : c.mode === 'ltr' ? (this.width + c.width) * progress - c.width : (this.width - c.width) / 2;
+    }
     const c = this.active.findLast(c => x >= c.x && x <= c.x + c.width && y >= c.y && y <= c.y + c.height);
     if (!c) return;
     try {
@@ -468,6 +518,7 @@ export class CanvasDanmu {
     this.freezeId = String(id);
     this.manualFreeze = !this.dispatchingHover;
     this.rebuildSpace();
+    this.draw();
   }
   restartComment(id) {
     if (this.releasingHover) return;
@@ -496,9 +547,9 @@ export class CanvasDanmu {
         c.raw._ = { ...c.raw._, isLike: node.getAttribute('data-is-like') === 'true', diggCount: Number(node.getAttribute('data-digg-count')) || 0 };
         Object.assign(c, this.sprite(c));
       }
-      this.config.hooks?.bulletDetached?.(c.raw, c.el);
-      c.el.remove();
-      c.el = null;
+      try { this.config.hooks?.bulletDetached?.(c.raw, c.el); }
+      catch (error) { console.warn('[DY Danmaku] Hover cleanup failed', error); }
+      finally { c.el.remove(); c.el = null; }
     }
     this.hovered = null;
     this.freezeId = null;
@@ -523,6 +574,7 @@ export class CanvasDanmu {
     this.timeline.clear();
     this.spriteCache.clear();
     this.emojiImages.destroy();
+    this.renderer?.destroy();
     this.host.remove();
     delete this.container.dataset.dyDanmakuEngine;
     if (!this.hadDanmuClass) this.container.classList.remove('danmu');

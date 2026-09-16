@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         抖音弹幕 Canvas 性能优化
 // @namespace    local.douyin-danmaku-performance
-// @version      0.2.0
+// @version      0.3.0
 // @description  保留弹幕内容，替换 DOM 弹幕引擎，优化播放与进度跳转。
 // @match        https://www.douyin.com/*
 // @run-at       document-start
@@ -358,7 +358,10 @@ SOFTWARE.
     const ctx = canvas.getContext("2d");
     ctx.font = style.font;
     const size = fontSize;
-    const measured = parts.map((part) => ({ ...part, width: part.url ? size + 8 : ctx.measureText(part.text).width }));
+    const measured = parts.map((part) => {
+      const entry = part.url ? images.get(part.url) : null;
+      return { ...part, entry, width: part.url && !entry.failed ? size + 8 : ctx.measureText(part.text).width };
+    });
     const badge = decorations.showDigg || decorations.isLike;
     const count = decorations.showDigg ? formatDiggCount(decorations.diggCount) : "";
     const iconSize = Math.max(fontSize, 20);
@@ -383,7 +386,7 @@ SOFTWARE.
     }
     let x = 17;
     for (const part of measured) {
-      const entry = part.url ? images.get(part.url) : null;
+      const entry = part.entry;
       if (entry?.ready) ctx.drawImage(entry.image, x + 4, (height - size) / 2, size, size);
       else {
         ctx.strokeText(part.text, x, height / 2, part.width);
@@ -405,6 +408,94 @@ SOFTWARE.
     }
     return { canvas, width, height, rich: parts.some((part) => part.url), imageVersion: images.version, bytes: canvas.width * canvas.height * 4 };
   }
+
+  // src/renderer.js
+  var SpriteRenderer = class {
+    constructor(host, metrics) {
+      this.metrics = metrics;
+      this.entries = /* @__PURE__ */ new Map();
+      this.layer = document.createElement("div");
+      this.layer.style.cssText = "position:absolute;inset:0;overflow:hidden;pointer-events:none;contain:layout style paint;";
+      host.appendChild(this.layer);
+    }
+    render(comment, width, progress, playing, rate, hidden) {
+      let entry = this.entries.get(comment);
+      if (!entry) {
+        const node2 = document.createElement("canvas");
+        node2.style.cssText = "position:absolute;left:0;top:0;pointer-events:none;will-change:transform;";
+        this.layer.appendChild(node2);
+        entry = { node: node2 };
+        this.entries.set(comment, entry);
+      }
+      const { node } = entry;
+      if (entry.sprite !== comment.canvas) {
+        node.width = comment.canvas.width;
+        node.height = comment.canvas.height;
+        node.getContext("2d").drawImage(comment.canvas, 0, 0);
+        node.style.width = `${comment.width}px`;
+        node.style.height = `${comment.height}px`;
+        entry.sprite = comment.canvas;
+        this.metrics.spriteUploads++;
+      }
+      const opacity = String(comment.raw.style?.opacity ?? 1);
+      if (entry.opacity !== opacity) {
+        node.style.opacity = opacity;
+        entry.opacity = opacity;
+      }
+      if (entry.hidden !== hidden) {
+        node.style.visibility = hidden ? "hidden" : "";
+        entry.hidden = hidden;
+      }
+      const geometry = `${width}:${comment.width}:${comment.y}:${comment.mode}:${comment.duration}`;
+      const expected = Math.max(0, progress * comment.duration * 1e3);
+      if (geometry !== entry.geometry) {
+        entry.animation?.cancel();
+        const start = comment.mode === "rtl" ? width : comment.mode === "ltr" ? -comment.width : (width - comment.width) / 2;
+        const end = comment.mode === "rtl" ? -comment.width : comment.mode === "ltr" ? width : start;
+        entry.animation = node.animate([
+          { transform: `translate3d(${start}px,${comment.y}px,0)` },
+          { transform: `translate3d(${end}px,${comment.y}px,0)` }
+        ], { duration: comment.duration * 1e3, fill: "both", easing: "linear" });
+        entry.animation.pause();
+        entry.animation.currentTime = expected;
+        entry.geometry = geometry;
+        entry.playing = false;
+      }
+      const animation = entry.animation;
+      if (animation.playbackRate !== rate) animation.updatePlaybackRate(rate);
+      const shouldPlay = playing && comment.frozenProgress == null && !hidden;
+      if (!shouldPlay || shouldPlay !== entry.playing || Math.abs(Number(animation.currentTime) - expected) > 100) {
+        animation.currentTime = expected;
+        this.metrics.animationSyncs++;
+      }
+      if (shouldPlay !== entry.playing) {
+        if (shouldPlay) animation.play();
+        else animation.pause();
+        entry.playing = shouldPlay;
+      }
+    }
+    retain(active) {
+      const current = new Set(active);
+      for (const [comment, entry] of this.entries) if (!current.has(comment)) {
+        entry.animation.cancel();
+        entry.node.remove();
+        this.entries.delete(comment);
+      }
+    }
+    pause() {
+      for (const entry of this.entries.values()) {
+        entry.animation?.pause();
+        entry.playing = false;
+      }
+    }
+    clear() {
+      this.retain([]);
+    }
+    destroy() {
+      this.clear();
+      this.layer.remove();
+    }
+  };
 
   // src/engine.js
   var instances = /* @__PURE__ */ new Set();
@@ -438,13 +529,14 @@ SOFTWARE.
       this.fontSizeOverride = false;
       this.durationOverrides = /* @__PURE__ */ new Map();
       this.channelSize = config.channelSize || 32;
+      this.dpr = window.devicePixelRatio || 1;
       this.position = 0;
       this.raf = 0;
       this.destroyed = false;
       this.inView = true;
       this.lastTime = NaN;
       this._status = "closed";
-      this.metrics = { frames: 0, drawn: 0, received: 0, seeks: 0, maxFrameMs: 0, frameMs: 0, layoutReads: 0, emojiSprites: 0 };
+      this.metrics = { frames: 0, drawn: 0, received: 0, seeks: 0, maxFrameMs: 0, frameMs: 0, layoutReads: 0, emojiSprites: 0, spriteUploads: 0, animationSyncs: 0 };
       this.originalStyle = this.container.getAttribute("style");
       this.hadDanmuClass = this.container.classList.contains("danmu");
       this.container.classList.add("danmu");
@@ -459,6 +551,10 @@ SOFTWARE.
       }
       this.stage.style.cssText = "position:absolute;left:0;top:0;pointer-events:none;";
       this.host.appendChild(this.stage);
+      if (config.renderer !== "canvas" && typeof this.stage.animate === "function") {
+        this.renderer = new SpriteRenderer(this.host, this.metrics);
+        this.stage.style.display = "none";
+      }
       this.space = {};
       resetSpace(this.space);
       this.main = {};
@@ -501,7 +597,10 @@ SOFTWARE.
         this.buffering = false;
         this.clear();
       });
-      this.bind(this.video, "ratechange", () => this.wake());
+      this.bind(this.video, "ratechange", () => {
+        this.draw();
+        this.wake();
+      });
       this.bind(document, "visibilitychange", () => {
         if (document.hidden) this.cancel();
         else this.wake();
@@ -513,6 +612,9 @@ SOFTWARE.
       });
       this.bind(window, "blur", () => {
         if (!this.manualFreeze) this.releaseHover();
+      });
+      this.bind(window, "resize", () => {
+        if (this.dpr !== (window.devicePixelRatio || 1)) this.resize();
       });
       this.resizeObserver = new ResizeObserver(() => this.resize());
       this.resizeObserver.observe(this.container);
@@ -574,12 +676,16 @@ SOFTWARE.
     cancel() {
       cancelAnimationFrame(this.raf);
       this.raf = 0;
+      this.renderer?.pause();
     }
     wake() {
       if (this.destroyed || this.raf || this._status !== "playing" || this.video.paused || this.video.seeking || this.buffering || document.hidden || !this.inView || !this.width || !this.height) return;
-      this.raf = requestAnimationFrame(() => {
+      this.raf = requestAnimationFrame((timestamp) => {
         this.raf = 0;
-        this.frame();
+        if (!this.renderer || !this.lastTick || timestamp - this.lastTick >= 32) {
+          this.lastTick = timestamp;
+          this.frame();
+        }
         this.wake();
       });
     }
@@ -597,6 +703,7 @@ SOFTWARE.
     pause() {
       if (this._status !== "closed") this._status = "paused";
       this.cancel();
+      this.draw();
     }
     stop() {
       this._status = "closed";
@@ -617,6 +724,7 @@ SOFTWARE.
       this.windowStart = this.now();
       this.position = lowerBound(this.timeline.items, this.windowStart);
       this.lastTime = NaN;
+      this.renderer?.clear();
       canvas_default.framing(this.stage);
     }
     updateComments(comments, replace = true) {
@@ -745,6 +853,11 @@ SOFTWARE.
       if (this.destroyed) return;
       const rect = this.container.getBoundingClientRect();
       this.metrics.layoutReads++;
+      if (this.dpr !== (window.devicePixelRatio || 1)) {
+        this.dpr = window.devicePixelRatio || 1;
+        this.spriteCache.clear();
+        this.cacheBytes = 0;
+      }
       this.width = rect.width;
       this.height = rect.height;
       const area = this.config.area;
@@ -752,7 +865,15 @@ SOFTWARE.
       this.renderHeight = area.lines > 0 ? Math.min(this.height - this.top, area.lines * this.channelSize) : Math.max(0, this.height * Math.min(1, area.end ?? 1) - this.top);
       this.host.style.top = `${this.top}px`;
       this.host.style.height = `${this.renderHeight}px`;
-      canvas_default.resize(this.stage, this.width, this.renderHeight);
+      if (this.renderer) {
+        this.stage.width = 1;
+        this.stage.height = 1;
+      } else {
+        this.stage.width = Math.ceil(this.width * this.dpr);
+        this.stage.height = Math.ceil(this.renderHeight * this.dpr);
+        this.stage.style.width = `${this.width}px`;
+        this.stage.style.height = `${this.renderHeight}px`;
+      }
       if (this.windowStart == null) this.resetFrame();
       else this.reflow();
       this.emit("channel_resize");
@@ -765,7 +886,7 @@ SOFTWARE.
       const parts = splitEmoji(text, this.emojiListMapped);
       const rich = parts.some((part) => part.url);
       const decorations = { isDanmuAuthor: !!item.raw.prior && !item.raw._?.isAnchor, ...item.raw._ };
-      const key = JSON.stringify([parts, fontSize, this.channelSize, style.color || "#fff", decorations.isLike, decorations.showDigg, decorations.diggCount, decorations.isDanmuAuthor, decorations.isAnchor, rich ? this.emojiImages.version : 0]);
+      const key = JSON.stringify([parts, fontSize, this.channelSize, this.dpr, style.color || "#fff", decorations.isLike, decorations.showDigg, decorations.diggCount, decorations.isDanmuAuthor, decorations.isAnchor, rich ? this.emojiImages.version : 0]);
       let cached = this.spriteCache.get(key);
       if (cached) {
         this.spriteCache.delete(key);
@@ -787,13 +908,15 @@ SOFTWARE.
       return cached;
     }
     refreshEmoji() {
+      let resized = false;
       for (const c of this.active) {
         if (c.rich && c.imageVersion !== this.emojiImages.version) {
           const next = this.sprite(c);
-          c.canvas = next.canvas;
-          c.imageVersion = next.imageVersion;
+          if (next.width !== c.width) resized = true;
+          Object.assign(c, next);
         }
       }
+      if (resized) this.reflow();
     }
     progress(c, time = this.now()) {
       return c.frozenProgress ?? (time - c.time) / c.duration;
@@ -811,6 +934,21 @@ SOFTWARE.
         this.space[c.mode].splice(-1, 0, record);
       }
       for (const lane of Object.values(this.space)) lane.sort((a, b) => a.range - b.range);
+    }
+    overlapsDuringFlight(candidate) {
+      const time = this.now();
+      for (const other of this.active) {
+        if (other.mode !== candidate.mode || other.y + other.height <= candidate.y || candidate.y + candidate.height <= other.y) continue;
+        if (other.frozenProgress != null) return true;
+        const remaining = Math.max(0, other.duration * (1 - this.progress(other, time)));
+        if (remaining === 0) continue;
+        if (candidate.mode === "top" || candidate.mode === "bottom") return true;
+        const elapsed = (time - other.time) * (this.width + other.width) / other.duration;
+        const tail = this.width + other.width - elapsed;
+        const velocity = (this.width + candidate.width) / candidate.duration;
+        if (tail > this.width || remaining > this.width / velocity) return true;
+      }
+      return false;
     }
     reflow() {
       if (!this.stage) return;
@@ -834,7 +972,7 @@ SOFTWARE.
       if (this.destroyed) return;
       const begin = performance.now();
       const time = this.now();
-      if (Number.isFinite(this.lastTime) && (time < this.lastTime || time - this.lastTime > 1)) this.resetFrame();
+      if (Number.isFinite(this.lastTime) && time < this.lastTime) this.resetFrame();
       this.lastTime = time;
       this.active = this.active.filter((c) => {
         if (c.frozenProgress != null || this.progress(c, time) <= 1) return true;
@@ -865,7 +1003,7 @@ SOFTWARE.
         const oldSpace = this.space[c.mode].slice();
         c.y = allocate_default.call({ media: { currentTime: time, playbackRate: 1 }, _: { width: this.width, height: 1e9, duration: c.duration, space: this.space } }, c);
         if (c.mode === "bottom") c.y = 1e9 - c.height - c.y;
-        if (!this.renderHeight || c.y + c.height > Math.max(c.height, this.renderHeight)) {
+        if (!this.renderHeight || c.y + c.height > Math.max(c.height, this.renderHeight) || this.overlapsDuringFlight(c)) {
           this.space[c.mode] = oldSpace;
           break;
         }
@@ -885,13 +1023,19 @@ SOFTWARE.
     }
     draw() {
       const time = this.now();
-      canvas_default.framing(this.stage);
+      if (this.renderer) this.renderer.retain(this.active);
+      else canvas_default.framing(this.stage);
+      const playing = this._status === "playing" && !this.video.paused && !this.video.seeking && !this.buffering && this.inView && !document.hidden;
       for (const c of this.active) {
-        if (c === this.hovered) continue;
         const progress = this.progress(c, time);
         c.x = c.mode === "rtl" ? this.width - (this.width + c.width) * progress : c.mode === "ltr" ? (this.width + c.width) * progress - c.width : (this.width - c.width) / 2;
+        if (this.renderer) {
+          this.renderer.render(c, this.width, progress, playing, this.video.playbackRate || 1, c === this.hovered);
+          continue;
+        }
+        if (c === this.hovered) continue;
         this.stage.context.globalAlpha = c.raw.style?.opacity == null ? 1 : Math.max(0, Math.min(1, Number(c.raw.style.opacity) || 0));
-        canvas_default.render(this.stage, c);
+        this.stage.context.drawImage(c.canvas, c.x * this.dpr, c.y * this.dpr, c.width * this.dpr, c.height * this.dpr);
         this.metrics.drawn++;
       }
       this.stage.context.globalAlpha = 1;
@@ -907,6 +1051,10 @@ SOFTWARE.
       const rect = this.container.getBoundingClientRect();
       const x = event.clientX - rect.left;
       const y = event.clientY - rect.top - this.top;
+      for (const c2 of this.active) {
+        const progress = this.progress(c2);
+        c2.x = c2.mode === "rtl" ? this.width - (this.width + c2.width) * progress : c2.mode === "ltr" ? (this.width + c2.width) * progress - c2.width : (this.width - c2.width) / 2;
+      }
       const c = this.active.findLast((c2) => x >= c2.x && x <= c2.x + c2.width && y >= c2.y && y <= c2.y + c2.height);
       if (!c) return;
       try {
@@ -969,6 +1117,7 @@ SOFTWARE.
       this.freezeId = String(id);
       this.manualFreeze = !this.dispatchingHover;
       this.rebuildSpace();
+      this.draw();
     }
     restartComment(id) {
       if (this.releasingHover) return;
@@ -1000,9 +1149,14 @@ SOFTWARE.
           c.raw._ = { ...c.raw._, isLike: node.getAttribute("data-is-like") === "true", diggCount: Number(node.getAttribute("data-digg-count")) || 0 };
           Object.assign(c, this.sprite(c));
         }
-        this.config.hooks?.bulletDetached?.(c.raw, c.el);
-        c.el.remove();
-        c.el = null;
+        try {
+          this.config.hooks?.bulletDetached?.(c.raw, c.el);
+        } catch (error) {
+          console.warn("[DY Danmaku] Hover cleanup failed", error);
+        } finally {
+          c.el.remove();
+          c.el = null;
+        }
       }
       this.hovered = null;
       this.freezeId = null;
@@ -1029,6 +1183,7 @@ SOFTWARE.
       this.timeline.clear();
       this.spriteCache.clear();
       this.emojiImages.destroy();
+      this.renderer?.destroy();
       this.host.remove();
       delete this.container.dataset.dyDanmakuEngine;
       if (!this.hadDanmuClass) this.container.classList.remove("danmu");
@@ -1113,14 +1268,14 @@ SOFTWARE.
   }
 
   // package.json
-  var version = "0.2.0";
+  var version = "0.3.0";
 
   // src/userscript.js
   var diagnostics = { version, modules: [], replaced: 0, fallbacks: 0, incompatible: 0 };
   if (!window.__DY_DANMAKU_CANVAS__) {
     Object.defineProperty(window, "__DY_DANMAKU_CANVAS__", {
       configurable: true,
-      value: { status: () => ({ ...diagnostics, instances: [...instances].map((i) => ({ status: i.status, comments: i.timeline.items.length, active: i.active.length, pending: i.pending.length - i.pendingHead, emojiLoaded: [...i.emojiImages.entries.values()].filter((e) => e.ready).length, opacity: Number(i.container.style.opacity || 1), cacheBytes: i.cacheBytes, ...i.metrics })) }) }
+      value: { status: () => ({ ...diagnostics, instances: [...instances].map((i) => ({ status: i.status, renderer: i.renderer ? "compositor" : "canvas", comments: i.timeline.items.length, active: i.active.length, pending: i.pending.length - i.pendingHead, emojiLoaded: [...i.emojiImages.entries.values()].filter((e) => e.ready).length, opacity: Number(i.container.style.opacity || 1), cacheBytes: i.cacheBytes, ...i.metrics })) }) }
     });
     installHook(window, CanvasDanmu, diagnostics);
   }

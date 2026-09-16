@@ -6,7 +6,7 @@ const diagnostics = { version, modules: [], replaced: 0, fallbacks: 0, incompati
 if (!window.__DY_DANMAKU_CANVAS__) {
   Object.defineProperty(window, '__DY_DANMAKU_CANVAS__', {
     configurable: true,
-    value: { status: () => ({ ...diagnostics, instances: [...instances].map(i => ({ status: i.status, comments: i.timeline.items.length, active: i.active.length, pending: i.pending.length - i.pendingHead, emojiLoaded: [...i.emojiImages.entries.values()].filter(e => e.ready).length, opacity: Number(i.container.style.opacity || 1), cacheBytes: i.cacheBytes, ...i.metrics })) }) },
+    value: { status: () => ({ ...diagnostics, instances: [...instances].map(i => ({ status: i.status, renderer: i.renderer ? 'compositor' : 'canvas', comments: i.timeline.items.length, active: i.active.length, pending: i.pending.length - i.pendingHead, emojiLoaded: [...i.emojiImages.entries.values()].filter(e => e.ready).length, opacity: Number(i.container.style.opacity || 1), cacheBytes: i.cacheBytes, ...i.metrics })) }) },
   });
   installHook(window, CanvasDanmu, diagnostics);
 }

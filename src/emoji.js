@@ -66,7 +66,10 @@ export function drawRichSprite(parts, style, fontSize, images, channelSize, deco
   const ctx = canvas.getContext('2d');
   ctx.font = style.font;
   const size = fontSize;
-  const measured = parts.map(part => ({ ...part, width: part.url ? size + 8 : ctx.measureText(part.text).width }));
+  const measured = parts.map(part => {
+    const entry = part.url ? images.get(part.url) : null;
+    return { ...part, entry, width: part.url && !entry.failed ? size + 8 : ctx.measureText(part.text).width };
+  });
   const badge = decorations.showDigg || decorations.isLike;
   const count = decorations.showDigg ? formatDiggCount(decorations.diggCount) : '';
   const iconSize = Math.max(fontSize, 20);
@@ -87,7 +90,7 @@ export function drawRichSprite(parts, style, fontSize, images, channelSize, deco
   }
   let x = 17;
   for (const part of measured) {
-    const entry = part.url ? images.get(part.url) : null;
+    const entry = part.entry;
     if (entry?.ready) ctx.drawImage(entry.image, x + 4, (height - size) / 2, size, size);
     else {
       ctx.strokeText(part.text, x, height / 2, part.width);
