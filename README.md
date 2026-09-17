@@ -10,7 +10,7 @@
 
 沿用原播放器的透明度、字号、速度、弹幕区域和开关。完整缺项核对及验证边界见 [功能兼容记录](docs/compatibility.md)，性能分析依据见 [调查记录](docs/investigation.md)。
 
-GitHub Actions 已配置 Greasy Fork Webhook 自动同步。首次使用需绑定脚本 Raw 链接，并填写 `GREASYFORK_WEBHOOK_SECRET` 仓库密钥，步骤见 [自动同步配置](docs/greasyfork-sync.md)。
+Greasy Fork 自动同步使用 GitHub 仓库自带的 Webhook。首次使用需绑定脚本 Raw 链接，并在仓库 Webhook 中填写 Secret、启用推送，步骤见 [自动同步配置](docs/greasyfork-sync.md)。
 
 ## 本次修复
 

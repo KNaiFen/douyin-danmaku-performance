@@ -1,6 +1,8 @@
 # Greasy Fork 自动同步
 
-工作流 `.github/workflows/greasyfork-sync.yml` 在 `main` 分支的安装脚本更新后发送带签名的 push Webhook，让 Greasy Fork 拉取脚本。工作流及发送工具更新也会触发，可从 Actions 手动运行。不需要另外在 GitHub Settings > Webhooks 创建重复的 Webhook。
+使用 GitHub 仓库 Settings > Webhooks 直接通知 Greasy Fork，不使用 GitHub Actions。密钥填写在 Webhook 的 Secret 字段，不需要 Actions Secret。
+
+本仓库已创建 [Greasy Fork Webhook](https://github.com/KNaiFen/douyin-danmaku-performance/settings/hooks/680616867)，地址、JSON、push 事件和 SSL 验证已预设；当前未启用，等待你填写 Secret 后勾选 Active 并保存。
 
 ## 一次性配置
 
@@ -10,25 +12,27 @@
    https://raw.githubusercontent.com/KNaiFen/douyin-danmaku-performance/main/douyin-danmaku-performance.user.js
    ```
 
-2. 打开 [GitHub 仓库 Actions Secrets](https://github.com/KNaiFen/douyin-danmaku-performance/settings/secrets/actions)，新增 Repository secret：
+2. 打开 [GitHub 仓库 Webhooks](https://github.com/KNaiFen/douyin-danmaku-performance/settings/hooks)，编辑对应的 Greasy Fork Webhook；如果尚无对应条目，点击 Add webhook。参数如下：
 
-   - 名称：`GREASYFORK_WEBHOOK_SECRET`
-   - 值：Greasy Fork 账号「设置 webhook」页面给出的 Secret。必须与 Greasy Fork 一致，不是 GitHub Token，也不是 Payload URL。
+   | 字段 | 值 |
+   | --- | --- |
+   | Payload URL | `https://api.greasyfork.org/zh-CN/users/718827-knaifen/webhook` |
+   | Content type | `application/json` |
+   | Secret | Greasy Fork 账号「设置 webhook」页提供的 Secret |
+   | SSL verification | Enable SSL verification |
+   | Which events | Just the push event |
+   | Active | 填完 Secret 后勾选 |
 
-3. 打开 [Sync to Greasy Fork 工作流](https://github.com/KNaiFen/douyin-danmaku-performance/actions/workflows/greasyfork-sync.yml)，点击 Run workflow，选择 `main`，运行一次。首次成功后，Greasy Fork 的同步方式会显示为 Webhook。
+3. 保存 Webhook。密钥由你填写，必须与 Greasy Fork 一致，不是 GitHub Token 或 Payload URL。未配置密钥前保持 Active 关闭，避免发送无法验证的请求。
 
-Webhook 地址已配置为 `https://api.greasyfork.org/zh-CN/users/718827-knaifen/webhook`。密钥只从 Actions Secret 读取，不写入代码或日志。未配置密钥时会显示 Skipped 提示并结束，不发送请求；配置完成后需要手动运行或再次推送脚本。
+4. 推送一次安装脚本的版本更新，进入 Webhook 的 Recent Deliveries 检查 push 响应。`updated_scripts` 应包含本脚本，`updated_failed` 应为空；同时检查 Greasy Fork 版本。首次成功同步后，其同步方式会显示为 Webhook。ping 成功只代表连接与签名验证通过，不代表脚本已更新。
 
 ## 后续发布
 
 更新 `package.json` 和 `package-lock.json` 的版本，执行 `npm run build`，提交并推送生成的 `douyin-danmaku-performance.user.js` 到 `main`。Greasy Fork 同步的是这个安装文件；只修改 `src/` 不会发布。新版本应提高 `@version`，让油猴能够识别更新。
 
-工作流读取运行时 `main` 的最新提交，因此重跑旧任务也会同步最新代码。发送只使用仓库读取权限；每次调用超时为 60 秒，同一仓库串行同步。HTTP 错误、无匹配脚本、同步校验失败和异常响应都会使任务失败。具体服务器校验原因可在 Greasy Fork 脚本管理页面排查。
+GitHub 原生 Webhook 自带签名和修改文件列表，Greasy Fork 根据同步 URL 匹配仓库、分支与文件。HTTP 403 通常表示 Secret 不匹配；HTTP 200 但 `updated_scripts` 为空仍不代表同步成功，应检查抖音脚本是否已导入且 Raw URL 是否一致。同步失败时查看响应与 Greasy Fork 管理页；重发历史 push 可能重新同步旧提交，优先使用最新脚本对应的事件。
 
-## 接口依据与验证
+原 Actions 工作流和发送工具已移除，不再使用 `GREASYFORK_WEBHOOK_SECRET`；如果此前自行添加过这个 Actions Secret，可以删除。
 
-GitHub Actions 的 push 事件省略了 commit 的 `modified` 字段，不能直接把事件 JSON 转发。发送工具构建只包含本脚本路径的通知，并指定已检出的提交 SHA。依据：[GitHub push 文档](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#push)、[Greasy Fork 路径匹配源码](https://github.com/greasyfork-org/greasyfork/blob/master/lib/github.rb)。
-
-请求同时附带 HMAC-SHA1 和 HMAC-SHA256 签名；前者用于兼容 Greasy Fork 当前验证逻辑。依据：[Greasy Fork Webhook 源码](https://github.com/greasyfork-org/greasyfork/blob/master/app/controllers/concerns/webhooks.rb)、[GitHub 签名说明](https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries)。
-
-本地核验：`node --test tests/greasyfork-sync.test.mjs`。测试使用模拟响应验证签名、路径、成功/失败判断及密钥缺失处理，不请求真实发布接口。完整端到端同步需要上述密钥及 Greasy Fork 脚本绑定完成。
+参考：[GitHub 创建 Webhook](https://docs.github.com/en/webhooks/using-webhooks/creating-webhooks)、[Greasy Fork 路径匹配源码](https://github.com/greasyfork-org/greasyfork/blob/master/lib/github.rb)、[Greasy Fork Webhook 源码](https://github.com/greasyfork-org/greasyfork/blob/master/app/controllers/concerns/webhooks.rb)。
