@@ -10,6 +10,8 @@
 
 沿用原播放器的透明度、字号、速度、弹幕区域和开关。完整缺项核对及验证边界见 [功能兼容记录](docs/compatibility.md)，性能分析依据见 [调查记录](docs/investigation.md)。
 
+GitHub Actions 已配置 Greasy Fork Webhook 自动同步。首次使用需绑定脚本 Raw 链接，并填写 `GREASYFORK_WEBHOOK_SECRET` 仓库密钥，步骤见 [自动同步配置](docs/greasyfork-sync.md)。
+
 ## 本次修复
 
 - 0.3.3：跳转时分批准备隐藏位图，完成后统一显示目标画面，避免逐条冒出；位图上传计入协作预算，使用可取消的消息任务接续，并补齐准备期间经过的时间段。暂停和异步回包仍能完成恢复，不丢掉尚未准备的内容。
