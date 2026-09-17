@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         抖音弹幕 Canvas 性能优化
 // @namespace    local.douyin-danmaku-performance
-// @version      0.3.4
+// @version      0.3.5
 // @description  保留弹幕内容，替换 DOM 弹幕引擎，优化播放与进度跳转。
 // @match        https://www.douyin.com/*
 // @run-at       document-start
@@ -383,6 +383,9 @@ SOFTWARE.
     canvas.height = height * dpr2;
     ctx.scale(dpr2, dpr2);
     Object.assign(ctx, style);
+    ctx.textBaseline = "alphabetic";
+    const metrics = ctx.measureText("M");
+    const baseline = height / 2 + Math.floor((metrics.fontBoundingBoxAscent - metrics.fontBoundingBoxDescent) / 2);
     if (decorations.isDanmuAuthor || decorations.isAnchor) {
       ctx.beginPath();
       ctx.roundRect(1, 1, width - 2, height - 2, Math.min(25, height / 2));
@@ -394,14 +397,15 @@ SOFTWARE.
         ctx.stroke();
       }
       Object.assign(ctx, style);
+      ctx.textBaseline = "alphabetic";
     }
     let x = 17;
     for (const part of measured) {
       const entry = part.entry;
       if (entry?.ready) ctx.drawImage(entry.image, x + 4, (height - size) / 2, size, size);
       else {
-        ctx.strokeText(part.text, x, height / 2, part.width);
-        ctx.fillText(part.text, x, height / 2, part.width);
+        ctx.strokeText(part.text, x, baseline, part.width);
+        ctx.fillText(part.text, x, baseline, part.width);
       }
       x += part.width;
     }
@@ -409,12 +413,14 @@ SOFTWARE.
       x += 12;
       ctx.fillStyle = decorations.isLike ? "#ff4370" : style.fillStyle;
       ctx.font = `${iconSize}px sans-serif`;
+      ctx.textBaseline = "middle";
       ctx.strokeText("\u2665", x, height / 2, iconSize);
       ctx.fillText("\u2665", x, height / 2, iconSize);
       ctx.font = style.font;
+      ctx.textBaseline = "alphabetic";
       if (count) {
-        ctx.strokeText(count, x + iconSize + 6, height / 2);
-        ctx.fillText(count, x + iconSize + 6, height / 2);
+        ctx.strokeText(count, x + iconSize + 6, baseline);
+        ctx.fillText(count, x + iconSize + 6, baseline);
       }
     }
     return { canvas, width, height, rich: parts.some((part) => part.url), imageVersion: images.version, bytes: canvas.width * canvas.height * 4 };
@@ -527,6 +533,7 @@ SOFTWARE.
 
   // src/engine.js
   var instances = /* @__PURE__ */ new Set();
+  var fontFamily = '"PingFang SC", "Microsoft YaHei", sans-serif';
   var CanvasDanmu = class {
     constructor(config) {
       if (!config?.container || !(config.player?.video || config.player)?.addEventListener) {
@@ -1033,7 +1040,7 @@ SOFTWARE.
         this.spriteCache.set(key, cached);
         return cached;
       }
-      const style2d = { font: `400 ${fontSize}px "PingFang SC", "Microsoft YaHei", sans-serif`, fillStyle: style.color || "#fff", strokeStyle: "#000", lineWidth: 2, textBaseline: "middle" };
+      const style2d = { font: `400 ${fontSize}px ${fontFamily}`, fillStyle: style.color || "#fff", strokeStyle: "#000", lineWidth: 2, textBaseline: "middle" };
       if (measureOnly) {
         const { width, height } = measureRichSprite(parts, style2d, fontSize, this.emojiImages, this.channelSize, decorations);
         return { width, height, fontSize };
@@ -1299,9 +1306,16 @@ SOFTWARE.
         el.style.cssText += `;position:absolute;left:${Math.max(0, Math.min(this.width - c.width, c.x))}px;top:${c.y}px;pointer-events:auto;z-index:11;white-space:nowrap;font-size:${c.fontSize}px;width:max-content;min-width:${c.width}px;min-height:${c.height}px;height:auto;line-height:normal;`;
         el.style.setProperty("--primary-font-size", `${c.fontSize}px`);
         el.style.setProperty("--danmaku-img-height", `${c.fontSize}px`);
+        el.style.fontFamily = fontFamily;
+        el.style.fontWeight = "400";
+        el.style.lineHeight = `${c.fontSize}px`;
         const content = el.querySelector("[data-danmu-id]") || el.firstElementChild;
         if (content) {
           content.style.setProperty("font-size", `${c.fontSize}px`, "important");
+          content.style.setProperty("font-family", fontFamily, "important");
+          content.style.setProperty("font-weight", "400", "important");
+          content.style.setProperty("line-height", `${c.fontSize}px`, "important");
+          content.style.setProperty("align-items", "center");
           content.style.setProperty("margin-top", "0", "important");
           content.style.setProperty("min-height", `${c.height}px`);
           content.style.setProperty("height", `${c.height}px`);
@@ -1505,7 +1519,7 @@ SOFTWARE.
   }
 
   // package.json
-  var version = "0.3.4";
+  var version = "0.3.5";
 
   // src/userscript.js
   var diagnostics = { version, modules: [], replaced: 0, fallbacks: 0, incompatible: 0 };

@@ -173,6 +173,82 @@ test('hover text stays the same size and leaving text or buttons inside player a
   }
 });
 
+test('native hover text and emoji keep their painted position across font sizes and player scales', async () => {
+  await page.addStyleTag({ content: `
+    .menu { border:1px solid transparent; align-items:center; font-family:"PingFang SC"; font-weight:400; }
+    .menu:hover { background:#333; height:42px; margin-top:-9px; }
+    .danMuText { display:flex; align-items:center; }
+    .danMuText img { width:var(--danmaku-img-height); height:var(--danmaku-img-height); margin:0 4px; }
+    .actions { color:#ff4370; background:none; border:0; }
+  ` });
+  await page.evaluate(() => {
+    const original = engine.config.hooks.bulletCreateEl;
+    const image = document.createElement('canvas'); image.width = 20; image.height = 20;
+    const ctx = image.getContext('2d'); ctx.fillStyle = '#00ff00'; ctx.fillRect(0, 0, 20, 20);
+    window.emojiURL = image.toDataURL();
+    engine.emojiListMapped = new Map([['[smile]', emojiURL]]);
+    engine.config.hooks.bulletCreateEl = raw => {
+      const el = original(raw);
+      const text = el.querySelector('.menu > span');
+      text.className = 'danMuText'; text.textContent = raw.text.replace('[smile]', '');
+      if (raw.text.includes('[smile]')) { const img = new Image(); img.src = emojiURL; text.append(img); }
+      return el;
+    };
+  });
+  const bounds = async clip => {
+    const png = await page.screenshot({ clip });
+    return page.evaluate(async data => {
+      const img = new Image(); img.src = data; await img.decode();
+      const canvas = document.createElement('canvas'); canvas.width = img.width; canvas.height = img.height;
+      const ctx = canvas.getContext('2d'); ctx.drawImage(img, 0, 0);
+      const pixels = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+      const boxes = { text: { left: Infinity, top: Infinity, right: -1, bottom: -1, sumY: 0, count: 0 }, emoji: { left: Infinity, top: Infinity, right: -1, bottom: -1, sumY: 0, count: 0 } };
+      for (let y = 0; y < canvas.height; y++) for (let x = 0; x < canvas.width; x++) {
+        const i = (y * canvas.width + x) * 4;
+        const key = pixels[i] > 220 && pixels[i + 1] > 220 && pixels[i + 2] > 220 ? 'text' :
+          pixels[i] < 30 && pixels[i + 1] > 220 && pixels[i + 2] < 30 ? 'emoji' : null;
+        if (key) { const b = boxes[key]; b.left = Math.min(b.left, x); b.top = Math.min(b.top, y); b.right = Math.max(b.right, x); b.bottom = Math.max(b.bottom, y); b.sumY += y; b.count++; }
+      }
+      for (const b of Object.values(boxes)) b.centerY = b.sumY / b.count;
+      return boxes;
+    }, 'data:image/png;base64,' + png.toString('base64'));
+  };
+  for (const [size, scale, rich] of [[20, 1, false], [24, 1, false], [32, 1, true], [24, 0.5, true]]) {
+    await page.mouse.move(0, 700);
+    const clip = await page.evaluate(({ size, scale, rich }) => {
+      media.currentTime = 0;
+      engine.stop(); engine.clear();
+      document.querySelector('#player').style.cssText = `transform:scale(${scale});transform-origin:top left;`;
+      engine.setFontSize(size, size + 12);
+      seed([comment('aligned', { text: 'Hg Test \u5f39\u5e55' + (rich ? '[smile]' : '') })]); advance(5);
+      const c = engine.active[0], rect = engine.container.getBoundingClientRect();
+      return { x: Math.floor(rect.left + c.x * scale), y: Math.floor(rect.top + c.y * scale), width: Math.ceil(c.width * scale), height: Math.ceil(c.height * scale) };
+    }, { size, scale, rich });
+    await page.waitForFunction(() => !engine.active[0].rich || engine.emojiImages.version > 0);
+    const before = await bounds(clip);
+    if (size === 32) {
+      await fs.mkdir('output/playwright', { recursive: true });
+      await page.locator('#player').screenshot({ path: 'output/playwright/hover-align-before.png' });
+    }
+    await page.mouse.move(clip.x + 25 * scale, clip.y + (size + 12) * scale / 2);
+    await page.waitForFunction(() => !!engine.hovered);
+    const hovered = await bounds(clip);
+    if (size === 32) await page.locator('#player').screenshot({ path: 'output/playwright/hover-align-active.png' });
+    await page.mouse.move(clip.x, clip.y + 90);
+    await page.waitForFunction(() => !engine.hovered);
+    const after = await bounds(clip);
+    for (const kind of rich ? ['text', 'emoji'] : ['text']) {
+      assert.ok(before[kind].right >= 0 && hovered[kind].right >= 0, JSON.stringify({ size, scale, kind, before, hovered }));
+      assert.ok(Math.abs(before[kind].centerY - hovered[kind].centerY) <= 1, JSON.stringify({ size, scale, kind, before, hovered }));
+      for (const edge of ['left', 'top', 'right', 'bottom']) {
+        // Downscaling a cached bitmap differs from rasterizing native DOM text.
+        assert.ok(Math.abs(before[kind][edge] - hovered[kind][edge]) <= (scale < 1 ? 2 : 1), JSON.stringify({ size, scale, kind, edge, before, hovered }));
+        assert.equal(before[kind][edge], after[kind][edge]);
+      }
+    }
+  }
+});
+
 test('menu shrinking away from pointer unlocks even without a DOM mouseleave', async () => {
   const result = await page.evaluate(() => {
     seed([comment('a')]); advance(2);

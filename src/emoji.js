@@ -88,6 +88,11 @@ export function drawRichSprite(parts, style, fontSize, images, channelSize, deco
   canvas.height = height * dpr;
   ctx.scale(dpr, dpr);
   Object.assign(ctx, style);
+  // CSS centers the font's ascent/descent box, not Canvas's em-square middle.
+  // Use the same alphabetic baseline as the native hover menu's line box.
+  ctx.textBaseline = 'alphabetic';
+  const metrics = ctx.measureText('M');
+  const baseline = height / 2 + Math.floor((metrics.fontBoundingBoxAscent - metrics.fontBoundingBoxDescent) / 2);
   if (decorations.isDanmuAuthor || decorations.isAnchor) {
     ctx.beginPath();
     ctx.roundRect(1, 1, width - 2, height - 2, Math.min(25, height / 2));
@@ -95,14 +100,15 @@ export function drawRichSprite(parts, style, fontSize, images, channelSize, deco
     ctx.fill();
     if (decorations.isDanmuAuthor) { ctx.strokeStyle = 'rgba(255,255,255,0.4)'; ctx.lineWidth = 1; ctx.stroke(); }
     Object.assign(ctx, style);
+    ctx.textBaseline = 'alphabetic';
   }
   let x = 17;
   for (const part of measured) {
     const entry = part.entry;
     if (entry?.ready) ctx.drawImage(entry.image, x + 4, (height - size) / 2, size, size);
     else {
-      ctx.strokeText(part.text, x, height / 2, part.width);
-      ctx.fillText(part.text, x, height / 2, part.width);
+      ctx.strokeText(part.text, x, baseline, part.width);
+      ctx.fillText(part.text, x, baseline, part.width);
     }
     x += part.width;
   }
@@ -110,10 +116,12 @@ export function drawRichSprite(parts, style, fontSize, images, channelSize, deco
     x += 12;
     ctx.fillStyle = decorations.isLike ? '#ff4370' : style.fillStyle;
     ctx.font = `${iconSize}px sans-serif`;
+    ctx.textBaseline = 'middle';
     ctx.strokeText('\u2665', x, height / 2, iconSize);
     ctx.fillText('\u2665', x, height / 2, iconSize);
     ctx.font = style.font;
-    if (count) { ctx.strokeText(count, x + iconSize + 6, height / 2); ctx.fillText(count, x + iconSize + 6, height / 2); }
+    ctx.textBaseline = 'alphabetic';
+    if (count) { ctx.strokeText(count, x + iconSize + 6, baseline); ctx.fillText(count, x + iconSize + 6, baseline); }
   }
   return { canvas, width, height, rich: parts.some(part => part.url), imageVersion: images.version, bytes: canvas.width * canvas.height * 4 };
 }

@@ -6,6 +6,7 @@ import { splitEmoji, EmojiImages, drawRichSprite, measureRichSprite } from './em
 import { SpriteRenderer } from './renderer.js';
 
 export const instances = new Set();
+const fontFamily = '"PingFang SC", "Microsoft YaHei", sans-serif';
 
 export class CanvasDanmu {
   constructor(config) {
@@ -410,7 +411,7 @@ export class CanvasDanmu {
     const key = JSON.stringify([parts, fontSize, this.channelSize, this.dpr, style.color || '#fff', decorations.isLike, decorations.showDigg, decorations.diggCount, decorations.isDanmuAuthor, decorations.isAnchor, rich ? this.emojiImages.version : 0]);
     let cached = this.spriteCache.get(key);
     if (cached) { this.spriteCache.delete(key); this.spriteCache.set(key, cached); return cached; }
-    const style2d = { font: `400 ${fontSize}px "PingFang SC", "Microsoft YaHei", sans-serif`, fillStyle: style.color || '#fff', strokeStyle: '#000', lineWidth: 2, textBaseline: 'middle' };
+    const style2d = { font: `400 ${fontSize}px ${fontFamily}`, fillStyle: style.color || '#fff', strokeStyle: '#000', lineWidth: 2, textBaseline: 'middle' };
     if (measureOnly) {
       const { width, height } = measureRichSprite(parts, style2d, fontSize, this.emojiImages, this.channelSize, decorations);
       return { width, height, fontSize };
@@ -665,9 +666,16 @@ export class CanvasDanmu {
       el.style.cssText += `;position:absolute;left:${Math.max(0, Math.min(this.width - c.width, c.x))}px;top:${c.y}px;pointer-events:auto;z-index:11;white-space:nowrap;font-size:${c.fontSize}px;width:max-content;min-width:${c.width}px;min-height:${c.height}px;height:auto;line-height:normal;`;
       el.style.setProperty('--primary-font-size', `${c.fontSize}px`);
       el.style.setProperty('--danmaku-img-height', `${c.fontSize}px`);
+      el.style.fontFamily = fontFamily;
+      el.style.fontWeight = '400';
+      el.style.lineHeight = `${c.fontSize}px`;
       const content = el.querySelector('[data-danmu-id]') || el.firstElementChild;
       if (content) {
         content.style.setProperty('font-size', `${c.fontSize}px`, 'important');
+        content.style.setProperty('font-family', fontFamily, 'important');
+        content.style.setProperty('font-weight', '400', 'important');
+        content.style.setProperty('line-height', `${c.fontSize}px`, 'important');
+        content.style.setProperty('align-items', 'center');
         content.style.setProperty('margin-top', '0', 'important');
         content.style.setProperty('min-height', `${c.height}px`);
         content.style.setProperty('height', `${c.height}px`);
