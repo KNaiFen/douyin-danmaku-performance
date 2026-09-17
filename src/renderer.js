@@ -73,7 +73,8 @@ export class SpriteRenderer {
   }
   progress(comment) {
     const entry = this.entries.get(comment);
-    return entry && !entry.hidden ? Number(entry.animation.currentTime) / (comment.duration * 1000) : undefined;
+    if (!entry || entry.hidden || entry.animation.currentTime == null) return undefined;
+    return entry.animation.playState === 'finished' ? 1 : Number(entry.animation.currentTime) / (comment.duration * 1000);
   }
   retain(active) {
     const current = new Set(active);

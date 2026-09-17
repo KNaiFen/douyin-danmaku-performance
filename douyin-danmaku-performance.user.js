@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         抖音弹幕 Canvas 性能优化
 // @namespace    local.douyin-danmaku-performance
-// @version      0.3.3
+// @version      0.3.4
 // @description  保留弹幕内容，替换 DOM 弹幕引擎，优化播放与进度跳转。
 // @match        https://www.douyin.com/*
 // @run-at       document-start
@@ -499,7 +499,8 @@ SOFTWARE.
     }
     progress(comment) {
       const entry = this.entries.get(comment);
-      return entry && !entry.hidden ? Number(entry.animation.currentTime) / (comment.duration * 1e3) : void 0;
+      if (!entry || entry.hidden || entry.animation.currentTime == null) return void 0;
+      return entry.animation.playState === "finished" ? 1 : Number(entry.animation.currentTime) / (comment.duration * 1e3);
     }
     retain(active) {
       const current = new Set(active);
@@ -640,6 +641,7 @@ SOFTWARE.
         this.seekTask = 0;
         this.seekCycle = false;
         this.seekResume = null;
+        this.restoreTime = null;
         this.buffering = false;
         this.clear();
       });
@@ -799,10 +801,10 @@ SOFTWARE.
     }
     clear() {
       if (this.video.seeking) this.beginSeek();
-      if (!this.seekCycle) this.timeline.clear();
+      if (!this.seekCycle && this.restoreTime == null) this.timeline.clear();
       this.resetFrame();
     }
-    resetFrame(restore = this.seekCycle || this.video.seeking) {
+    resetFrame(restore = this.seekCycle || this.video.seeking || this.restoreTime != null) {
       this.releaseHover(false);
       this.active = [];
       this.pending = [];
@@ -824,7 +826,7 @@ SOFTWARE.
       if (this.destroyed) return;
       this.metrics.received += comments?.length || 0;
       if (this.video.seeking) this.beginSeek();
-      if (this.seekCycle && replace && !comments?.length) return;
+      if ((this.seekCycle || this.restoreTime != null) && replace && !comments?.length) return;
       const nextTime = replace ? Infinity : this.timeline.items[this.position]?.time ?? Infinity;
       if (replace) {
         for (let i = this.pendingHead; i < this.pending.length; i++) this.emitted.delete(this.pending[i].id);
@@ -842,12 +844,12 @@ SOFTWARE.
       this.position = lowerBound(this.timeline.items, Math.max(this.windowStart, this.restoreTime != null ? this.now() - this.restoreWindow() : Math.min(nextTime, this.now() - 2)));
       if (this.restoreTime != null && this.restoreBatchTime == null && (comments || []).some((raw) => {
         const item = this.timeline.ids.get(String(raw?.id));
-        return item && !this.emitted.has(item.id) && !item.raw.realTime && item.time < this.restoreTime && item.time >= this.windowStart;
+        return item && !this.emitted.has(item.id) && !item.raw.realTime && item.time < this.now() && item.time >= Math.max(this.windowStart, this.now() - this.restoreWindow());
       })) this.restoreBatchTime = this.now();
       for (const raw of comments || []) {
         const item = this.timeline.ids.get(String(raw?.id));
         if (!item) continue;
-        if ((item.raw.prior || item.raw.realTime) && !(this.restoreTime != null && item.time < this.restoreTime && !item.raw.realTime) && item.time <= this.now() && !this.emitted.has(item.id)) {
+        if ((item.raw.prior || item.raw.realTime) && !(this.restoreTime != null && item.time < (this.restoreBatchTime ?? this.restoreTime) && !item.raw.realTime) && item.time <= this.now() && !this.emitted.has(item.id)) {
           this.emitted.add(item.id);
           this.pending.splice(this.pendingHead, 0, item);
         }
@@ -1065,6 +1067,9 @@ SOFTWARE.
     progress(c, time = this.now()) {
       return c.frozenProgress ?? (time - c.time) / c.duration;
     }
+    flightProgress(c, time = this.now()) {
+      return c.frozenProgress ?? (this._status === "playing" && !this.video.paused && !c.staged ? this.renderer?.progress(c) : void 0) ?? this.progress(c, time);
+    }
     retime(c, duration) {
       if (Math.abs(c.duration - duration) < 1e-8) return;
       const progress = c.frozenProgress ?? (this._status === "playing" && !this.video.paused ? this.renderer?.progress(c) : void 0) ?? this.progress(c);
@@ -1089,12 +1094,14 @@ SOFTWARE.
     }
     overlapsDuringFlight(candidate, active = this.active, time = this.now()) {
       const velocity = (c) => c.frozenProgress != null || !["rtl", "ltr"].includes(c.mode) ? 0 : (c.mode === "rtl" ? -1 : 1) * (this.width + c.width) / c.duration;
-      const remaining = (c) => c.frozenProgress != null ? Infinity : Math.max(0, c.duration * (1 - this.progress(c, time)));
+      const remaining = (c, progress) => c.frozenProgress != null ? Infinity : Math.max(0, c.duration * (1 - progress));
+      const candidateProgress = this.flightProgress(candidate, time);
       for (const other of active) {
         if (other.mode !== candidate.mode || other.y + other.height <= candidate.y || candidate.y + candidate.height <= other.y) continue;
-        const lifetime = Math.min(remaining(candidate), remaining(other));
+        const otherProgress = this.flightProgress(other, time);
+        const lifetime = Math.min(remaining(candidate, candidateProgress), remaining(other, otherProgress));
         if (lifetime <= 0) continue;
-        const gap = this.xAt(candidate, time) - this.xAt(other, time);
+        const gap = this.xForProgress(candidate, candidateProgress) - this.xForProgress(other, otherProgress);
         const relativeSpeed = velocity(candidate) - velocity(other);
         const endGap = relativeSpeed === 0 ? gap : gap + relativeSpeed * lifetime;
         if (Math.max(gap, endGap) > -candidate.width + 0.01 && Math.min(gap, endGap) < other.width - 0.01) return true;
@@ -1140,7 +1147,7 @@ SOFTWARE.
       if (Number.isFinite(this.lastTime) && time < this.lastTime) this.resetFrame(true);
       this.lastTime = time;
       this.active = this.active.filter((c) => {
-        if (c.frozenProgress != null || this.progress(c, time) <= 1) return true;
+        if (c.frozenProgress != null || this.flightProgress(c, time) < 1) return true;
         if (!c.staged) this.emit("bullet_remove", { bullet: c });
         return false;
       });
@@ -1498,7 +1505,7 @@ SOFTWARE.
   }
 
   // package.json
-  var version = "0.3.3";
+  var version = "0.3.4";
 
   // src/userscript.js
   var diagnostics = { version, modules: [], replaced: 0, fallbacks: 0, incompatible: 0 };

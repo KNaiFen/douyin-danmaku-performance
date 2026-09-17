@@ -723,6 +723,8 @@ test('playing seek survives native restart and restored comments continue withou
     advance(62);
     const after = restored.x;
     const ids = engine.active.map(c => c.id);
+    // advance() only changes the fake media clock; also finish the real animation.
+    engine.renderer.entries.get(restored).animation.finish();
     advance(70);
     return { before, after, running, ids, expired: !engine.active.some(c => c.id === 'restored') };
   });
@@ -971,4 +973,127 @@ test('replacement network batches retain unprepared comments in a seek snapshot'
     return { unprepared, count: ids.length, unique: new Set(ids).size };
   });
   assert.ok(result.unprepared > 0); assert.equal(result.count, 100); assert.equal(result.unique, 100);
+});
+
+test('accelerated comments finish their visible flight before being removed', async () => {
+  const result = await page.evaluate(async () => {
+    const runs = [];
+    for (const rate of [2, 3, 4]) {
+      engine.stop(); engine.clear();
+      media.playbackRate = rate;
+      engine.setAllDuration('scroll', 3000 / rate);
+      let origin;
+      Object.defineProperty(media, 'currentTime', { configurable: true, get: () => origin == null ? 0 : (performance.now() - origin) * rate / 1000 });
+      engine.resetFrame(false);
+      media.paused = false;
+      const removed = [];
+      const record = ({ bullet }) => {
+        const entry = engine.renderer.entries.get(bullet);
+        removed.push({ id: bullet.id, progress: engine.renderer.progress(bullet),
+          x: new DOMMatrix(getComputedStyle(entry.node).transform).m41, width: bullet.width, rate: entry.animation.playbackRate });
+      };
+      engine.on('bullet_remove', record);
+      engine.updateComments(Array.from({ length: 20 }, (_, i) => comment('flight' + i, { start: i * 80, duration: 3000 / rate })), true);
+      origin = performance.now();
+      engine.start();
+      await new Promise(resolve => setTimeout(resolve, 5000 / rate));
+      engine.pause(); engine.off('bullet_remove', record);
+      runs.push({ rate, removed });
+    }
+    return runs;
+  });
+  for (const { rate, removed } of result) {
+    assert.equal(removed.length, 20, JSON.stringify({ rate, removed }));
+    assert.ok(removed.every(c => c.rate === rate), JSON.stringify({ rate, removed }));
+    assert.ok(removed.every(c => c.x + c.width < 1), JSON.stringify({ rate, removed }));
+  }
+});
+
+test('delayed native seek cleanup preserves the target snapshot and cached history', async () => {
+  await page.evaluate(() => {
+    seed(Array.from({ length: 12 }, (_, i) => comment('cached' + i, { start: (48 + i) * 1000 })));
+    media.currentTime = 60; media.seeking = true; media.dispatchEvent(new Event('seeking'));
+    media.seeking = false; media.dispatchEvent(new Event('seeked'));
+  });
+  await page.waitForFunction(() => !engine.seekTask && !engine.hasRestoreWork());
+  await page.evaluate(() => {
+    engine.main.data = [];
+    engine.clear(); engine.stop(); engine.start(); engine.pause();
+  });
+  await page.waitForFunction(() => !engine.hasRestoreWork());
+  const result = await page.evaluate(() => ({ count: engine.active.length, cached: engine.timeline.items.length,
+    left: engine.active.some(c => c.x < 250), right: engine.active.some(c => c.x > 750) }));
+  assert.equal(result.count, 12); assert.equal(result.cached, 12); assert.ok(result.left && result.right);
+});
+
+test('late responses after an empty seek restore comments newer than the original seek target', async () => {
+  await page.evaluate(() => {
+    seed([]);
+    media.currentTime = 60; media.seeking = true; media.dispatchEvent(new Event('seeking'));
+    media.seeking = false; media.dispatchEvent(new Event('seeked'));
+  });
+  await page.waitForFunction(() => !engine.seekTask && !engine.hasRestoreWork());
+  await page.evaluate(() => {
+    media.currentTime = 64;
+    engine.updateComments([comment('late-new', { start: 61000 }), comment('late-priority', { start: 62000, prior: true })], false);
+  });
+  await page.waitForFunction(() => !engine.hasRestoreWork());
+  const result = await page.evaluate(() => {
+    const c = engine.active.find(c => c.id === 'late-new');
+    const priority = engine.active.find(c => c.id === 'late-priority');
+    return { time: c?.time, x: c?.x, priorityTime: priority?.time, priorityX: priority?.x };
+  });
+  assert.equal(result.time, 61); assert.ok(result.x < 850);
+  assert.equal(result.priorityTime, 62); assert.ok(result.priorityX < 900);
+});
+
+test('visible comments are not retired while the compositor still has half a flight left', async () => {
+  const result = await page.evaluate(async () => {
+    seed([comment('drift')]); advance(2);
+    media.paused = false; media.playbackRate = 4; engine.play();
+    const c = engine.active[0], entry = engine.renderer.entries.get(c);
+    await entry.animation.ready;
+    // Model a delayed animation clock after a browser rendering interruption.
+    entry.animation.currentTime = c.duration * 500;
+    media.currentTime = c.time + c.duration + 0.1;
+    engine.frame();
+    const retained = engine.active.includes(c) && entry.node.isConnected;
+    entry.animation.finish();
+    engine.frame();
+    return { retained, removed: !engine.active.includes(c) };
+  });
+  assert.ok(result.retained); assert.ok(result.removed);
+});
+
+test('retained visible flights still block colliding comments after the media expiry time', async () => {
+  const result = await page.evaluate(async () => {
+    engine.setArea({ lines: 1 });
+    seed([comment('leader', { text: 'Wide leader '.repeat(8) })]);
+    advance(2);
+    media.paused = false; media.playbackRate = 4; engine.play();
+    const c = engine.active[0], entry = engine.renderer.entries.get(c);
+    await entry.animation.ready;
+    entry.animation.currentTime = c.duration * 500;
+    media.currentTime = c.time + c.duration + 0.1;
+    engine.sendComment(comment('follower', { text: 'Wide follower '.repeat(8), realTime: true }));
+    return { active: engine.active.map(c => c.id), pending: engine.pending.slice(engine.pendingHead).map(c => c.id) };
+  });
+  assert.deepEqual(result.active, ['leader']); assert.deepEqual(result.pending, ['follower']);
+});
+
+test('seek history survives closing and reopening but is released when the video changes', async () => {
+  await page.evaluate(() => {
+    seed([comment('history', { start: 55000 })]);
+    media.currentTime = 60; media.seeking = true; media.dispatchEvent(new Event('seeking'));
+    media.seeking = false; media.dispatchEvent(new Event('seeked'));
+  });
+  await page.waitForFunction(() => !engine.seekTask && !engine.hasRestoreWork());
+  await page.evaluate(() => { engine.stop(); media.currentTime = 62; engine.start(); engine.pause(); });
+  await page.waitForFunction(() => !engine.hasRestoreWork());
+  const result = await page.evaluate(() => {
+    const restored = engine.active.some(c => c.id === 'history' && c.time === 55 && c.x < 600);
+    media.dispatchEvent(new Event('emptied'));
+    return { restored, data: engine.timeline.items.length, active: engine.active.length, restoreTime: engine.restoreTime };
+  });
+  assert.ok(result.restored); assert.equal(result.data, 0); assert.equal(result.active, 0); assert.equal(result.restoreTime, null);
 });
