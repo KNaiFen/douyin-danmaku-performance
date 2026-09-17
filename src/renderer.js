@@ -6,7 +6,7 @@ export class SpriteRenderer {
     this.layer.style.cssText = 'position:absolute;inset:0;overflow:hidden;pointer-events:none;contain:layout style paint;';
     host.appendChild(this.layer);
   }
-  render(comment, width, progress, playing, rate, hidden) {
+  render(comment, width, progress, playing, rate, hidden, sampledAt = performance.now()) {
     let entry = this.entries.get(comment);
     if (!entry) {
       const node = document.createElement('canvas');
@@ -30,6 +30,8 @@ export class SpriteRenderer {
     if (entry.hidden !== hidden) { node.style.visibility = hidden ? 'hidden' : ''; entry.hidden = hidden; }
     const geometry = `${width}:${comment.width}:${comment.y}:${comment.mode}:${comment.duration}`;
     const expected = Math.max(0, progress * comment.duration * 1000);
+    const shouldPlay = playing && comment.frozenProgress == null && !hidden;
+    let synchronize = entry.origin !== comment.time || entry.playing !== shouldPlay;
     if (geometry !== entry.geometry) {
       entry.animation?.cancel();
       const start = comment.mode === 'rtl' ? width : comment.mode === 'ltr' ? -comment.width : (width - comment.width) / 2;
@@ -43,21 +45,35 @@ export class SpriteRenderer {
       entry.geometry = geometry;
       entry.playing = false;
       entry.rate = undefined;
+      synchronize = true;
     }
     const animation = entry.animation;
-    if (entry.rate !== rate) { animation.updatePlaybackRate(rate); entry.rate = rate; }
-    const shouldPlay = playing && comment.frozenProgress == null && !hidden;
-    // Correct media-clock drift without resampling transform from JavaScript.
-    // During normal playback, the compositor owns every intermediate frame.
-    const drift = Math.abs(Number(animation.currentTime) - expected);
-    if (shouldPlay !== entry.playing || drift > (shouldPlay ? 100 : 0.5)) {
+    if (synchronize) {
+      animation.playbackRate = rate;
+      if (shouldPlay) {
+        // Document timelines are sampled at rendering opportunities, whereas
+        // media time advances during JS work. Anchor both to the same wall time.
+        animation.startTime = sampledAt - expected / rate;
+      } else {
+        animation.pause();
+        animation.currentTime = expected;
+      }
+      this.metrics.animationSyncs++;
+    } else if (!shouldPlay && !comment.staged && entry.expected !== expected) {
       animation.currentTime = expected;
       this.metrics.animationSyncs++;
+    } else if (entry.rate !== rate) {
+      // Preserve the compositor's current position when only speed changes.
+      animation.updatePlaybackRate(rate);
     }
-    if (shouldPlay !== entry.playing) {
-      if (shouldPlay) animation.play(); else animation.pause();
-      entry.playing = shouldPlay;
-    }
+    entry.playing = shouldPlay;
+    entry.origin = comment.time;
+    entry.expected = expected;
+    entry.rate = rate;
+  }
+  progress(comment) {
+    const entry = this.entries.get(comment);
+    return entry && !entry.hidden ? Number(entry.animation.currentTime) / (comment.duration * 1000) : undefined;
   }
   retain(active) {
     const current = new Set(active);

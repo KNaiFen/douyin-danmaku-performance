@@ -202,13 +202,14 @@ test('explicit report/login freeze remains until its native callback restarts', 
 });
 
 test('seek drops old backlog, buffering recovers on canplay and destruction cleans resources', async () => {
-  const result = await page.evaluate(() => {
+  const result = await page.evaluate(async () => {
     seed(Array.from({ length: 5000 }, (_, i) => comment(String(i))));
     const backlog = engine.pending.length - engine.pendingHead;
     media.dispatchEvent(new Event('waiting'));
     media.seeking = true; media.currentTime = 60; media.dispatchEvent(new Event('seeking'));
     media.seeking = false; media.dispatchEvent(new Event('seeked'));
     engine.updateComments([comment('target', { start: 60000 })], false); engine.frame();
+    await new Promise(resolve => setTimeout(resolve, 0));
     media.paused = false; engine.play(); media.dispatchEvent(new Event('canplay'));
     const recovered = !engine.buffering && !!(engine.raf || engine.timer);
     const ids = engine.active.map(c => c.id);
@@ -727,4 +728,247 @@ test('playing seek survives native restart and restored comments continue withou
   });
   assert.equal(result.running, 'running'); assert.ok(result.after < result.before);
   assert.deepEqual(result.ids, ['restored', 'next']); assert.ok(result.expired);
+});
+
+test('dense seek prepares hidden sprites and publishes the entire snapshot together', async () => {
+  const result = await page.evaluate(() => {
+    seed(Array.from({ length: 960 }, (_, i) => comment(String(i), { start: 45610 + i * 15 })));
+    media.currentTime = 60; media.seeking = true; media.dispatchEvent(new Event('seeking'));
+    media.seeking = false; engine.seekCycle = false;
+    const clock = performance.now.bind(performance);
+    let cost = 0;
+    performance.now = () => { cost += 0.3; return cost; };
+    const partial = [];
+    let passes = 0;
+    do {
+      engine.frame(); passes++;
+      const visible = [...engine.renderer.entries.values()].filter(entry => getComputedStyle(entry.node).visibility !== 'hidden').length;
+      if (engine.hasRestoreWork()) partial.push(visible);
+    } while (engine.hasRestoreWork() && passes < 1000);
+    performance.now = clock;
+    const visible = [...engine.renderer.entries.values()].filter(entry => getComputedStyle(entry.node).visibility !== 'hidden').length;
+    return { passes, partial, visible, active: engine.active.length };
+  });
+  assert.ok(result.passes > 1 && result.passes < 1000);
+  assert.ok(result.partial.every(visible => visible === 0), 'Incomplete seek snapshots must not be visible');
+  assert.ok(result.visible > 20); assert.equal(result.visible, result.active);
+});
+
+test('busy 4x playback with coarse media samples does not repeatedly hard-seek the animation', async () => {
+  const result = await page.evaluate(async () => {
+    seed([comment('smooth')]); advance(2);
+    media.playbackRate = 4; media.paused = false;
+    const origin = performance.now();
+    Object.defineProperty(media, 'currentTime', { configurable: true, get: () => 2 + Math.floor((performance.now() - origin) / 100) * 0.4 });
+    engine.play();
+    const entry = engine.renderer.entries.get(engine.active[0]);
+    await entry.animation.ready;
+    const syncs = engine.metrics.animationSyncs;
+    const times = [];
+    for (let i = 0; i < 12; i++) {
+      await new Promise(resolve => requestAnimationFrame(resolve));
+      const end = performance.now() + 35;
+      while (performance.now() < end) { /* Deliberately emulate page work. */ }
+      engine.draw();
+      times.push(Number(entry.animation.currentTime));
+    }
+    const extraSyncs = engine.metrics.animationSyncs - syncs;
+    engine.pause();
+    return { extraSyncs, times };
+  });
+  assert.equal(result.extraSyncs, 0, 'Steady playback must not rewrite animation.currentTime');
+  assert.ok(result.times.every((time, i) => !i || time >= result.times[i - 1]));
+  assert.ok(result.times.at(-1) - result.times[0] > 1000);
+});
+
+test('repeated native rate settings retain animation phase and moving hover uses displayed position', async () => {
+  const result = await page.evaluate(async () => {
+    seed([comment('phase')]); advance(2);
+    media.playbackRate = 4; media.paused = false;
+    const origin = performance.now();
+    Object.defineProperty(media, 'currentTime', { configurable: true, get: () => 2 + Math.floor((performance.now() - origin) / 200) * 0.8 });
+    engine.play();
+    const c = engine.active[0], entry = engine.renderer.entries.get(c);
+    const animation = entry.animation;
+    const syncs = engine.metrics.animationSyncs;
+    for (let i = 0; i < 6; i++) {
+      await new Promise(resolve => setTimeout(resolve, 35));
+      engine.setAllDuration('scroll', 14400 / 4);
+    }
+    const unchanged = animation === entry.animation && engine.metrics.animationSyncs === syncs;
+    const bounds = entry.node.getBoundingClientRect();
+    const progress = Number(entry.animation.currentTime) / (c.duration * 1000);
+    engine.hitTest({ clientX: bounds.left + 25, clientY: bounds.top + 15 });
+    return { unchanged, hovered: engine.hovered === c, before: progress, frozen: c.frozenProgress };
+  });
+  assert.ok(result.unchanged); assert.ok(result.hovered);
+  assert.ok(Math.abs(result.before - result.frozen) < 0.001);
+});
+
+test('sprites created across a busy task share a common animation phase', async () => {
+  const result = await page.evaluate(() => {
+    seed([comment('a'), comment('b')]); advance(2);
+    engine.renderer.clear();
+    const sampledAt = performance.now();
+    engine.renderer.render(engine.active[0], engine.width, engine.progress(engine.active[0]), true, 4, false, sampledAt);
+    const end = performance.now() + 50;
+    while (performance.now() < end) { /* Simulate expensive batch preparation. */ }
+    engine.renderer.render(engine.active[1], engine.width, engine.progress(engine.active[1]), true, 4, false, sampledAt);
+    return engine.active.map(c => engine.renderer.entries.get(c).animation.startTime);
+  });
+  assert.ok(Math.abs(result[0] - result[1]) < 0.001);
+});
+
+test('actual video playback stays monotonic through 2x and 4x rates under page work', async () => {
+  const result = await page.evaluate(async () => {
+    engine.destroy();
+    const source = document.createElement('canvas'); source.width = 160; source.height = 90;
+    const ctx = source.getContext('2d');
+    const stream = source.captureStream(30);
+    const recorder = new MediaRecorder(stream, { mimeType: 'video/webm' });
+    const chunks = [];
+    recorder.ondataavailable = event => chunks.push(event.data);
+    const stopped = new Promise(resolve => { recorder.onstop = resolve; });
+    let frame = 0;
+    const paint = setInterval(() => { ctx.fillStyle = frame++ % 2 ? '#274431' : '#476f54'; ctx.fillRect(0, 0, 160, 90); }, 30);
+    recorder.start();
+    await new Promise(resolve => setTimeout(resolve, 3500));
+    recorder.stop(); await stopped;
+    clearInterval(paint); stream.getTracks().forEach(track => track.stop());
+    const url = URL.createObjectURL(new Blob(chunks, { type: 'video/webm' }));
+    const video = document.createElement('video'); video.muted = true; video.src = url;
+    document.querySelector('#player').prepend(video);
+    await new Promise((resolve, reject) => { video.onloadeddata = resolve; video.onerror = reject; });
+    const results = [];
+    try {
+      for (const rate of [2, 4]) {
+        video.pause();
+        if (video.currentTime !== 0) { video.currentTime = 0; await new Promise(resolve => video.addEventListener('seeked', resolve, { once: true })); }
+        video.playbackRate = 1;
+        window.engine = new Engine.CanvasDanmu({ container: document.querySelector('#overlay'), player: video, defaultOff: true, comments: [comment('video', { duration: 14400 })] });
+        engine.start(); await video.play();
+        await new Promise(resolve => setTimeout(resolve, 100));
+        video.playbackRate = rate;
+        engine.setAllDuration('scroll', 14400 / rate);
+        const c = engine.active[0], entry = engine.renderer.entries.get(c);
+        await entry.animation.ready;
+        const beforeSyncs = engine.metrics.animationSyncs;
+        const samples = [];
+        const until = performance.now() + 500;
+        do {
+          await new Promise(resolve => requestAnimationFrame(resolve));
+          const end = performance.now() + 12;
+          while (performance.now() < end) { /* Simulate other player work. */ }
+          engine.draw();
+          samples.push({ x: new DOMMatrix(getComputedStyle(entry.node).transform).m41, time: video.currentTime });
+        } while (performance.now() < until);
+        results.push({ rate, samples, syncs: engine.metrics.animationSyncs - beforeSyncs, actualRate: entry.animation.playbackRate });
+        video.pause(); engine.destroy();
+      }
+      return results;
+    } finally { video.pause(); engine.destroy(); video.remove(); URL.revokeObjectURL(url); }
+  });
+  for (const run of result) {
+    assert.equal(run.actualRate, run.rate); assert.equal(run.syncs, 0);
+    assert.ok(run.samples.at(-1).time - run.samples[0].time > 0.5);
+    assert.ok(run.samples.every((sample, i) => !i || sample.x <= run.samples[i - 1].x + 0.01));
+    assert.ok(run.samples[0].x - run.samples.at(-1).x > 40);
+  }
+});
+
+test('late seek batches publish together without resynchronizing already visible animations', async () => {
+  await page.evaluate(() => {
+    seed([comment('published', { start: 55000 })]);
+    media.currentTime = 60; media.seeking = true; media.dispatchEvent(new Event('seeking'));
+    media.seeking = false; media.dispatchEvent(new Event('seeked'));
+  });
+  await page.waitForFunction(() => !engine.seekTask && !engine.hasRestoreWork());
+  const result = await page.evaluate(() => {
+    media.paused = false; media.playbackRate = 4; engine.play();
+    const published = engine.active[0], entry = engine.renderer.entries.get(published);
+    const startTime = entry.animation.startTime;
+    engine.updateComments(Array.from({ length: 100 }, (_, i) => comment('late' + i, { start: 50000 + i * 50 })), false);
+    engine.cancel(); engine.draw();
+    const anchor = entry.animation.startTime;
+    const clock = performance.now.bind(performance);
+    let cost = 0, passes = 0, partial = 0;
+    performance.now = () => { cost += 0.3; return cost; };
+    do {
+      engine.frame(); passes++;
+      if (engine.hasRestoreWork()) partial += engine.active.filter(c => c !== published && !c.staged).length;
+    } while (engine.hasRestoreWork() && passes < 1000);
+    performance.now = clock;
+    return { partial, passes, unchanged: anchor === entry.animation.startTime, visible: engine.active.filter(c => !c.staged).length, startTime };
+  });
+  assert.ok(result.passes > 1 && result.passes < 1000);
+  assert.equal(result.partial, 0); assert.ok(result.unchanged); assert.ok(result.visible > 1);
+});
+
+test('seek snapshot catches up with playback before publishing new historical positions', async () => {
+  const result = await page.evaluate(() => {
+    seed([...Array.from({ length: 100 }, (_, i) => comment(String(i), { start: 53000 + i * 50 })), comment('during-restore', { start: 60500 })]);
+    media.currentTime = 60; media.seeking = true; media.dispatchEvent(new Event('seeking'));
+    media.seeking = false; engine.seekCycle = false;
+    const clock = performance.now.bind(performance);
+    let cost = 0, passes = 0;
+    performance.now = () => { cost += 0.3; return cost; };
+    engine.frame();
+    const partial = engine.hasRestoreWork();
+    media.currentTime = 61;
+    while (engine.hasRestoreWork() && passes++ < 1000) engine.frame();
+    performance.now = clock;
+    const c = engine.active.find(c => c.id === 'during-restore');
+    return { partial, finished: !engine.hasRestoreWork(), visible: !!c && !c.staged, start: c?.time, x: c?.x, width: engine.width };
+  });
+  assert.ok(result.partial); assert.ok(result.finished); assert.ok(result.visible);
+  assert.equal(result.start, 60.5); assert.ok(result.x < result.width);
+});
+
+test('pausing during reconstruction still finishes and stopping cancels queued tasks', async () => {
+  await page.evaluate(() => {
+    seed(Array.from({ length: 960 }, (_, i) => comment(String(i), { start: 45610 + i * 15 })));
+    media.currentTime = 60; media.seeking = true; media.dispatchEvent(new Event('seeking'));
+    media.seeking = false; engine.seekCycle = false;
+    const clock = performance.now.bind(performance);
+    let cost = 0;
+    performance.now = () => { cost += 0.3; return cost; };
+    engine.frame();
+    performance.now = clock;
+    media.paused = true; media.dispatchEvent(new Event('pause'));
+  });
+  await page.waitForFunction(() => !engine.hasRestoreWork());
+  const result = await page.evaluate(async () => {
+    const visible = engine.active.filter(c => !c.staged).length;
+    const paused = [...engine.renderer.entries.values()].every(entry => entry.animation.playState === 'paused');
+    engine.resetFrame(true); engine.wake();
+    const scheduled = !!engine.restoreTask;
+    engine.stop();
+    const callbacks = engine.metrics.schedulerCallbacks;
+    await new Promise(resolve => setTimeout(resolve, 25));
+    const stopped = !engine.restoreTask && !engine.active.length && callbacks === engine.metrics.schedulerCallbacks;
+    engine.destroy();
+    return { visible, paused, scheduled, stopped, released: engine.restoreChannel === null };
+  });
+  assert.ok(result.visible > 20); assert.ok(result.paused); assert.ok(result.scheduled);
+  assert.ok(result.stopped); assert.ok(result.released);
+});
+
+test('replacement network batches retain unprepared comments in a seek snapshot', async () => {
+  const result = await page.evaluate(() => {
+    const items = Array.from({ length: 100 }, (_, i) => comment(String(i), { start: 53000 + i * 50 }));
+    seed(items);
+    media.currentTime = 60; media.seeking = true; media.dispatchEvent(new Event('seeking'));
+    media.seeking = false; engine.seekCycle = false;
+    const clock = performance.now.bind(performance);
+    let cost = 0, passes = 0;
+    performance.now = () => { cost += 0.3; return cost; };
+    engine.frame();
+    const unprepared = engine.restoreQueue.length - engine.restoreHead;
+    engine.updateComments(items, true);
+    while (engine.hasRestoreWork() && passes++ < 1000) engine.frame();
+    performance.now = clock;
+    const ids = [...engine.active, ...engine.pending.slice(engine.pendingHead)].map(c => c.id);
+    return { unprepared, count: ids.length, unique: new Set(ids).size };
+  });
+  assert.ok(result.unprepared > 0); assert.equal(result.count, 100); assert.equal(result.unique, 100);
 });

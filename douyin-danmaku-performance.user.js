@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         抖音弹幕 Canvas 性能优化
 // @namespace    local.douyin-danmaku-performance
-// @version      0.3.2
+// @version      0.3.3
 // @description  保留弹幕内容，替换 DOM 弹幕引擎，优化播放与进度跳转。
 // @match        https://www.douyin.com/*
 // @run-at       document-start
@@ -429,7 +429,7 @@ SOFTWARE.
       this.layer.style.cssText = "position:absolute;inset:0;overflow:hidden;pointer-events:none;contain:layout style paint;";
       host.appendChild(this.layer);
     }
-    render(comment, width, progress, playing, rate, hidden) {
+    render(comment, width, progress, playing, rate, hidden, sampledAt = performance.now()) {
       let entry = this.entries.get(comment);
       if (!entry) {
         const node2 = document.createElement("canvas");
@@ -459,6 +459,8 @@ SOFTWARE.
       }
       const geometry = `${width}:${comment.width}:${comment.y}:${comment.mode}:${comment.duration}`;
       const expected = Math.max(0, progress * comment.duration * 1e3);
+      const shouldPlay = playing && comment.frozenProgress == null && !hidden;
+      let synchronize = entry.origin !== comment.time || entry.playing !== shouldPlay;
       if (geometry !== entry.geometry) {
         entry.animation?.cancel();
         const start = comment.mode === "rtl" ? width : comment.mode === "ltr" ? -comment.width : (width - comment.width) / 2;
@@ -472,23 +474,32 @@ SOFTWARE.
         entry.geometry = geometry;
         entry.playing = false;
         entry.rate = void 0;
+        synchronize = true;
       }
       const animation = entry.animation;
-      if (entry.rate !== rate) {
-        animation.updatePlaybackRate(rate);
-        entry.rate = rate;
-      }
-      const shouldPlay = playing && comment.frozenProgress == null && !hidden;
-      const drift = Math.abs(Number(animation.currentTime) - expected);
-      if (shouldPlay !== entry.playing || drift > (shouldPlay ? 100 : 0.5)) {
+      if (synchronize) {
+        animation.playbackRate = rate;
+        if (shouldPlay) {
+          animation.startTime = sampledAt - expected / rate;
+        } else {
+          animation.pause();
+          animation.currentTime = expected;
+        }
+        this.metrics.animationSyncs++;
+      } else if (!shouldPlay && !comment.staged && entry.expected !== expected) {
         animation.currentTime = expected;
         this.metrics.animationSyncs++;
+      } else if (entry.rate !== rate) {
+        animation.updatePlaybackRate(rate);
       }
-      if (shouldPlay !== entry.playing) {
-        if (shouldPlay) animation.play();
-        else animation.pause();
-        entry.playing = shouldPlay;
-      }
+      entry.playing = shouldPlay;
+      entry.origin = comment.time;
+      entry.expected = expected;
+      entry.rate = rate;
+    }
+    progress(comment) {
+      const entry = this.entries.get(comment);
+      return entry && !entry.hidden ? Number(entry.animation.currentTime) / (comment.duration * 1e3) : void 0;
     }
     retain(active) {
       const current = new Set(active);
@@ -718,13 +729,14 @@ SOFTWARE.
       return Math.max(this.duration, this.mediaDuration(this.timeline.maxDuration), ...this.durationOverrides.values());
     }
     hasRestoreWork() {
-      return this.restoreTime != null && (this.restoreHead < this.restoreQueue.length || this.timeline.items[this.position]?.time <= this.now());
+      return this.restoreBatchTime != null;
     }
     cancel() {
       cancelAnimationFrame(this.raf);
       clearTimeout(this.timer);
       this.raf = 0;
       this.timer = 0;
+      this.restoreTask = null;
       this.renderer?.pause();
     }
     wake(immediate = false) {
@@ -733,7 +745,7 @@ SOFTWARE.
         this.timer = 0;
       }
       const restoring = this.hasRestoreWork();
-      if (this.destroyed || this.raf || this.timer || this._status === "closed" || !restoring && (this._status !== "playing" || this.video.paused) || this.video.seeking || this.buffering || document.hidden || !this.inView || !this.width || !this.height) return;
+      if (this.destroyed || this.raf || this.timer || this.restoreTask || this._status === "closed" || !restoring && (this._status !== "playing" || this.video.paused) || this.video.seeking || this.seekCycle || this.buffering || document.hidden || !this.inView || !this.width || !this.height) return;
       const tick = () => {
         this.raf = 0;
         this.timer = 0;
@@ -741,10 +753,23 @@ SOFTWARE.
         this.frame();
         this.wake();
       };
-      if (this.renderer) {
+      if (restoring) {
+        if (!this.restoreChannel) {
+          this.restoreChannel = new MessageChannel();
+          this.restoreChannel.port1.onmessage = ({ data }) => {
+            if (this.restoreTask?.id !== data) return;
+            const task = this.restoreTask;
+            this.restoreTask = null;
+            task.tick();
+          };
+        }
+        const id = this.restoreTaskId = (this.restoreTaskId || 0) + 1;
+        this.restoreTask = { id, tick };
+        this.restoreChannel.port2.postMessage(id);
+      } else if (this.renderer) {
         const nextTime = this.timeline.items[this.position]?.time ?? Infinity;
-        const idle = !restoring && !this.active.length && this.pendingHead === this.pending.length;
-        const delay = restoring ? 4 : idle ? Math.min(1e3, Math.max(32, (nextTime - this.now()) * 1e3 / (this.video.playbackRate || 1))) : 32;
+        const idle = !this.active.length && this.pendingHead === this.pending.length;
+        const delay = idle ? Math.min(1e3, Math.max(32, (nextTime - this.now()) * 1e3 / (this.video.playbackRate || 1))) : 32;
         this.timer = setTimeout(tick, immediate ? 0 : delay);
       } else this.raf = requestAnimationFrame(tick);
     }
@@ -764,6 +789,7 @@ SOFTWARE.
       if (this._status !== "closed") this._status = "paused";
       this.cancel();
       this.draw();
+      this.wake();
     }
     stop() {
       if (this.video.seeking) this.beginSeek();
@@ -787,6 +813,7 @@ SOFTWARE.
       this.emitted.clear();
       resetSpace(this.space);
       this.restoreTime = restore ? this.now() : null;
+      this.restoreBatchTime = this.restoreTime;
       this.windowStart = restore ? Math.max(0, this.now() - this.restoreWindow()) : this.now();
       this.position = lowerBound(this.timeline.items, this.windowStart);
       this.lastTime = NaN;
@@ -799,6 +826,10 @@ SOFTWARE.
       if (this.video.seeking) this.beginSeek();
       if (this.seekCycle && replace && !comments?.length) return;
       const nextTime = replace ? Infinity : this.timeline.items[this.position]?.time ?? Infinity;
+      if (replace) {
+        for (let i = this.pendingHead; i < this.pending.length; i++) this.emitted.delete(this.pending[i].id);
+        for (let i = this.restoreHead; i < this.restoreQueue.length; i++) this.emitted.delete(this.restoreQueue[i].id);
+      }
       this.timeline.update(comments, replace, this.now());
       this.candidate = null;
       if (replace) {
@@ -809,6 +840,10 @@ SOFTWARE.
       }
       if (this.restoreTime != null) this.windowStart = Math.max(0, this.restoreTime - this.restoreWindow());
       this.position = lowerBound(this.timeline.items, Math.max(this.windowStart, this.restoreTime != null ? this.now() - this.restoreWindow() : Math.min(nextTime, this.now() - 2)));
+      if (this.restoreTime != null && this.restoreBatchTime == null && (comments || []).some((raw) => {
+        const item = this.timeline.ids.get(String(raw?.id));
+        return item && !this.emitted.has(item.id) && !item.raw.realTime && item.time < this.restoreTime && item.time >= this.windowStart;
+      })) this.restoreBatchTime = this.now();
       for (const raw of comments || []) {
         const item = this.timeline.ids.get(String(raw?.id));
         if (!item) continue;
@@ -1031,7 +1066,8 @@ SOFTWARE.
       return c.frozenProgress ?? (time - c.time) / c.duration;
     }
     retime(c, duration) {
-      const progress = this.progress(c);
+      if (Math.abs(c.duration - duration) < 1e-8) return;
+      const progress = c.frozenProgress ?? (this._status === "playing" && !this.video.paused ? this.renderer?.progress(c) : void 0) ?? this.progress(c);
       c.duration = duration;
       c.time = this.now() - progress * duration;
     }
@@ -1046,6 +1082,9 @@ SOFTWARE.
     }
     xAt(c, time = this.now()) {
       const progress = this.progress(c, time);
+      return this.xForProgress(c, progress);
+    }
+    xForProgress(c, progress) {
       return c.mode === "rtl" ? this.width - (this.width + c.width) * progress : c.mode === "ltr" ? (this.width + c.width) * progress - c.width : (this.width - c.width) / 2;
     }
     overlapsDuringFlight(candidate, active = this.active, time = this.now()) {
@@ -1094,7 +1133,7 @@ SOFTWARE.
       this.draw();
     }
     frame() {
-      if (this.destroyed) return;
+      if (this.destroyed || this.video.seeking || this.seekCycle) return;
       const begin = performance.now();
       const deadline = begin + 4;
       const time = this.now();
@@ -1102,13 +1141,14 @@ SOFTWARE.
       this.lastTime = time;
       this.active = this.active.filter((c) => {
         if (c.frozenProgress != null || this.progress(c, time) <= 1) return true;
-        this.emit("bullet_remove", { bullet: c });
+        if (!c.staged) this.emit("bullet_remove", { bullet: c });
         return false;
       });
       if (!this.active.length) resetSpace(this.space);
       else if (this.freezeId) this.rebuildSpace();
       const items = this.timeline.items;
-      while (this.position < items.length && items[this.position].time <= time) {
+      const cutoff = this.restoreBatchTime ?? time;
+      while (this.position < items.length && items[this.position].time <= cutoff) {
         if (this.position % 64 === 0 && performance.now() >= deadline) {
           this.metrics.budgetYields++;
           break;
@@ -1117,7 +1157,7 @@ SOFTWARE.
         if (this.emitted.has(item.id)) continue;
         this.emitted.add(item.id);
         if (this.isHidden(item)) continue;
-        if (this.restoreTime != null && item.time < this.restoreTime && !item.raw.realTime) this.restoreQueue.push(item);
+        if (this.restoreTime != null && item.time < (this.restoreBatchTime ?? this.restoreTime) && !item.raw.realTime) this.restoreQueue.push(item);
         else this.pending.push(item);
       }
       if (this.restoreHead < this.restoreQueue.length) this.rebuildSpace();
@@ -1139,8 +1179,9 @@ SOFTWARE.
         if (c.mode === "bottom") c.y = this.renderHeight - c.height - c.y;
         if (fits && !this.overlapsDuringFlight(c, this.active, time)) {
           Object.assign(c, this.sprite(item));
+          c.staged = true;
           this.active.push(c);
-          this.emit("bullet_start", c);
+          this.renderer?.render(c, this.width, this.progress(c, time), false, this.video.playbackRate || 1, true);
         } else {
           this.space[c.mode] = oldSpace;
           this.pending.push(item);
@@ -1150,7 +1191,18 @@ SOFTWARE.
         this.restoreQueue = [];
         this.restoreHead = 0;
       }
-      while (this.pendingHead < this.pending.length) {
+      if (this.restoreBatchTime != null && !this.restoreQueue.length && !(items[this.position]?.time <= cutoff)) {
+        const publishTime = this.now();
+        if (items[this.position]?.time < publishTime) this.restoreBatchTime = publishTime;
+        else {
+          this.restoreBatchTime = null;
+          for (const c of this.active) if (c.staged) {
+            c.staged = false;
+            this.emit("bullet_start", c);
+          }
+        }
+      }
+      while (this.restoreBatchTime == null && this.pendingHead < this.pending.length) {
         if (performance.now() >= deadline) {
           this.metrics.budgetYields++;
           break;
@@ -1163,6 +1215,7 @@ SOFTWARE.
         const mode = item.raw.mode || "scroll";
         if (this.candidate?.item !== item) this.candidate = { item, comment: { ...item, ...this.sprite(item) } };
         const c = this.candidate.comment;
+        c.staged = false;
         c.mode = mode === "scroll" ? this.config.direction === "l2r" ? "ltr" : "rtl" : mode;
         if (!["rtl", "ltr", "top", "bottom"].includes(c.mode)) c.mode = "rtl";
         c.time = time;
@@ -1191,6 +1244,7 @@ SOFTWARE.
       this.metrics.maxFrameMs = Math.max(this.metrics.maxFrameMs, this.metrics.frameMs);
     }
     draw() {
+      const sampledAt = performance.now();
       const time = this.now();
       if (this.renderer) this.renderer.retain(this.active);
       else canvas_default.framing(this.stage);
@@ -1199,10 +1253,11 @@ SOFTWARE.
         const progress = this.progress(c, time);
         c.x = this.xAt(c, time);
         if (this.renderer) {
-          this.renderer.render(c, this.width, progress, playing, this.video.playbackRate || 1, c === this.hovered);
+          if (c.staged && this.renderer.entries.get(c)?.sprite === c.canvas) continue;
+          this.renderer.render(c, this.width, progress, playing, this.video.playbackRate || 1, c === this.hovered || !!c.staged, sampledAt);
           continue;
         }
-        if (c === this.hovered) continue;
+        if (c === this.hovered || c.staged) continue;
         this.stage.context.globalAlpha = c.raw.style?.opacity == null ? 1 : Math.max(0, Math.min(1, Number(c.raw.style.opacity) || 0));
         this.stage.context.drawImage(c.canvas, c.x * this.dpr, c.y * this.dpr, c.width * this.dpr, c.height * this.dpr);
         this.metrics.drawn++;
@@ -1223,15 +1278,15 @@ SOFTWARE.
       const x = (event.clientX - rect.left) / scaleX;
       const y = (event.clientY - rect.top) / scaleY - this.top;
       for (const c2 of this.active) {
-        c2.x = this.xAt(c2);
+        c2.x = this.xForProgress(c2, this.renderer?.progress(c2) ?? this.progress(c2));
       }
-      const c = this.active.findLast((c2) => x >= c2.x && x <= c2.x + c2.width && y >= c2.y && y <= c2.y + c2.height);
+      const c = this.active.findLast((c2) => !c2.staged && x >= c2.x && x <= c2.x + c2.width && y >= c2.y && y <= c2.y + c2.height);
       if (!c) return;
       try {
         const el = this.config.hooks.bulletCreateEl(c.raw);
         if (!el) return;
         this.hovered = c;
-        c.frozenProgress = this.progress(c);
+        c.frozenProgress = this.renderer?.progress(c) ?? this.progress(c);
         c.el = el;
         Object.assign(el.style, c.raw.style || {});
         el.style.cssText += `;position:absolute;left:${Math.max(0, Math.min(this.width - c.width, c.x))}px;top:${c.y}px;pointer-events:auto;z-index:11;white-space:nowrap;font-size:${c.fontSize}px;width:max-content;min-width:${c.width}px;min-height:${c.height}px;height:auto;line-height:normal;`;
@@ -1283,7 +1338,7 @@ SOFTWARE.
     freezeComment(id) {
       const c = this.active.find((c2) => c2.id === String(id));
       if (!c) return;
-      c.frozenProgress = this.progress(c);
+      c.frozenProgress = c.frozenProgress ?? this.renderer?.progress(c) ?? this.progress(c);
       this.freezeId = String(id);
       this.manualFreeze = !this.dispatchingHover;
       this.rebuildSpace();
@@ -1346,6 +1401,9 @@ SOFTWARE.
       this.seekTask = 0;
       this.stop();
       this.destroyed = true;
+      this.restoreChannel?.port1.close();
+      this.restoreChannel?.port2.close();
+      this.restoreChannel = null;
       this.emit("destroy");
       this.resizeObserver.disconnect();
       this.intersectionObserver.disconnect();
@@ -1440,7 +1498,7 @@ SOFTWARE.
   }
 
   // package.json
-  var version = "0.3.2";
+  var version = "0.3.3";
 
   // src/userscript.js
   var diagnostics = { version, modules: [], replaced: 0, fallbacks: 0, incompatible: 0 };
