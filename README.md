@@ -4,6 +4,8 @@
 
 适用于电脑浏览器中的抖音视频页面，不适用于直播间和手机 App。
 
+项目链接：https://github.com/KNaiFen/douyin-danmaku-performance
+
 ## 功能
 
 - **弹幕更流畅**：优化密集弹幕的滚动与倍速播放，不通过关闭弹幕或固定数量截断来提速。
