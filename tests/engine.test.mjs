@@ -565,3 +565,166 @@ test('rebuilding animation geometry preserves effective playback rate', async ()
   });
   assert.equal(rate, 2);
 });
+
+test('seek restores in-flight comments at their target-time positions while paused', async () => {
+  await page.evaluate(() => {
+    seed(Array.from({ length: 12 }, (_, i) => comment(String(i), { start: (48 + i) * 1000 })));
+    media.currentTime = 60; media.seeking = true; media.dispatchEvent(new Event('seeking'));
+    media.seeking = false; media.dispatchEvent(new Event('seeked'));
+  });
+  await page.waitForFunction(() => engine.active.length === 12);
+  const result = await page.evaluate(() => ({
+    status: engine.status,
+    comments: engine.active.map(c => ({ id: c.id, time: c.time, x: c.x, expected: 1000 - (1000 + c.width) * (60 - c.time) / c.duration,
+      rendered: new DOMMatrix(getComputedStyle(engine.renderer.entries.get(c).node).transform).m41 })),
+  }));
+  assert.equal(result.status, 'paused');
+  assert.ok(result.comments.some(c => c.x < 200));
+  assert.ok(result.comments.some(c => c.x > 800));
+  for (const c of result.comments) {
+    assert.equal(c.time, 48 + Number(c.id));
+    assert.ok(Math.abs(c.x - c.expected) < 0.01);
+    assert.ok(Math.abs(c.rendered - c.expected) < 0.01);
+  }
+  await fs.mkdir('output/playwright', { recursive: true });
+  await page.locator('#player').screenshot({ path: 'output/playwright/seek-restored.png' });
+});
+
+test('native seek clear/stop lifecycle retains loaded data and delayed batches fill the paused screen', async () => {
+  await page.evaluate(() => {
+    seed([comment('cached', { start: 55000 })]);
+    media.currentTime = 60; media.seeking = true;
+    // The player's listener can run before the replacement's media listener.
+    engine.main.data = []; engine.stop();
+    media.dispatchEvent(new Event('seeking'));
+    media.seeking = false;
+    engine.clear(); engine.stop();
+    media.dispatchEvent(new Event('seeked'));
+  });
+  await page.waitForFunction(() => engine.active.some(c => c.id === 'cached'));
+  await page.evaluate(() => engine.updateComments([
+    comment('late', { start: 52000 }), comment('expired', { start: 1000 }), comment('future', { start: 70000 }),
+  ], false));
+  await page.waitForFunction(() => engine.active.some(c => c.id === 'late'));
+  const result = await page.evaluate(() => ({ ids: engine.active.map(c => c.id).sort(), x: engine.active.find(c => c.id === 'late').x, timer: engine.timer }));
+  assert.deepEqual(result.ids, ['cached', 'late']); assert.ok(result.x < 500);
+  await page.waitForFunction(() => !engine.timer);
+});
+
+test('rapid seeks discard older reconstruction tasks, old backlog and expired late responses', async () => {
+  await page.evaluate(() => {
+    seed(Array.from({ length: 1000 }, (_, i) => comment('old' + i)));
+    engine.updateComments([comment('first', { start: 25000 }), comment('final', { start: 85000 })], false);
+    for (const target of [30, 60, 90]) {
+      media.currentTime = target; media.seeking = true; media.dispatchEvent(new Event('seeking'));
+      media.seeking = false; media.dispatchEvent(new Event('seeked'));
+    }
+    engine.updateComments([comment('late-old-target', { start: 28000 })], false);
+  });
+  await page.waitForFunction(() => engine.active.some(c => c.id === 'final'));
+  const result = await page.evaluate(() => ({ ids: engine.active.map(c => c.id), pending: engine.pending.length - engine.pendingHead, restore: engine.restoreQueue.length - engine.restoreHead }));
+  assert.deepEqual(result.ids, ['final']); assert.equal(result.pending, 0); assert.equal(result.restore, 0);
+});
+
+test('seek respects actual durations, playback rate and fixed modes', async () => {
+  await page.evaluate(() => {
+    media.playbackRate = 2;
+    seed([
+      comment('slow', { start: 35000, duration: 15000 }),
+      comment('expired', { start: 50000, duration: 2000 }),
+      comment('top', { start: 55000, mode: 'top', duration: 7200 }),
+      comment('bottom', { start: 56000, mode: 'bottom', duration: 7200 }),
+    ]);
+    media.currentTime = 60; media.seeking = true; media.dispatchEvent(new Event('seeking'));
+    media.seeking = false; media.dispatchEvent(new Event('seeked'));
+  });
+  await page.waitForFunction(() => engine.active.length === 3);
+  const result = await page.evaluate(() => ({ ids: engine.active.map(c => c.id).sort(), slow: engine.active.find(c => c.id === 'slow').duration,
+    bottom: engine.active.find(c => c.id === 'bottom').y }));
+  assert.deepEqual(result.ids, ['bottom', 'slow', 'top']); assert.equal(result.slow, 30); assert.ok(result.bottom > 400);
+});
+
+test('seek does not enable a closed engine and media replacement clears saved comments', async () => {
+  await page.evaluate(() => {
+    seed([comment('previous-video', { start: 55000 })]); engine.stop();
+    media.currentTime = 60; media.seeking = true; media.dispatchEvent(new Event('seeking'));
+    media.seeking = false; media.dispatchEvent(new Event('seeked'));
+  });
+  await page.waitForFunction(() => !engine.seekTask);
+  assert.equal(await page.evaluate(() => engine.status), 'closed');
+  const result = await page.evaluate(() => {
+    media.dispatchEvent(new Event('emptied')); engine.start();
+    return { data: engine.main.data.length, active: engine.active.length, restore: engine.restoreQueue.length };
+  });
+  assert.deepEqual(result, { data: 0, active: 0, restore: 0 });
+});
+
+test('dense paused seeks yield, retain overflow and rasterize only accepted historical comments', async () => {
+  await page.evaluate(() => {
+    seed(Array.from({ length: 960 }, (_, i) => comment(String(i), { start: 45610 + i * 15 })));
+    window.buildsBeforeSeek = engine.metrics.spriteBuilds;
+    media.currentTime = 60; media.seeking = true; media.dispatchEvent(new Event('seeking'));
+    media.seeking = false; media.dispatchEvent(new Event('seeked'));
+  });
+  await page.waitForFunction(() => !engine.seekTask && !engine.hasRestoreWork());
+  const result = await page.evaluate(() => {
+    const row = engine.active;
+    const overlap = row.some((c, i) => row.slice(i + 1).some(other =>
+      c.y < other.y + other.height && other.y < c.y + c.height && c.x < other.x + other.width - 0.01 && other.x < c.x + c.width - 0.01));
+    return { active: row.length, retained: row.length + engine.pending.length - engine.pendingHead, overlap,
+      builds: engine.metrics.spriteBuilds - buildsBeforeSeek,
+      left: row.some(c => c.x < 250 && c.x + c.width > 0), right: row.some(c => c.x > 750 && c.x < 1000) };
+  });
+  assert.equal(result.retained, 960); assert.equal(result.overlap, false);
+  assert.ok(result.left && result.right); assert.ok(result.builds <= result.active + 1);
+});
+
+test('seek restoration retains emoji, opacity and hover release at a restored position', async () => {
+  await page.evaluate(() => {
+    const image = document.createElement('canvas'); image.width = 20; image.height = 20;
+    const ctx = image.getContext('2d'); ctx.fillStyle = '#00ff00'; ctx.fillRect(0, 0, 20, 20);
+    engine.emojiListMapped = new Map([['[smile]', image.toDataURL()]]);
+    engine.setOpacity(0.4);
+    seed([comment('restored-emoji', { text: 'Seek [smile]', start: 55000 })]);
+    media.currentTime = 60; media.seeking = true; media.dispatchEvent(new Event('seeking'));
+    media.seeking = false; media.dispatchEvent(new Event('seeked'));
+  });
+  await page.waitForFunction(() => engine.active.length === 1 && engine.emojiImages.version > 0);
+  const point = await page.evaluate(() => {
+    const c = engine.active[0], rect = engine.container.getBoundingClientRect();
+    const pixels = c.canvas.getContext('2d').getImageData(0, 0, c.canvas.width, c.canvas.height).data;
+    let green = 0; for (let i = 0; i < pixels.length; i += 4) if (pixels[i] === 0 && pixels[i + 1] === 255 && pixels[i + 2] === 0) green++;
+    return { x: rect.left + c.x + 25, y: rect.top + c.y + 15, green, opacity: getComputedStyle(engine.container).opacity };
+  });
+  assert.ok(point.green > 200); assert.equal(point.opacity, '0.4');
+  await page.mouse.move(point.x, point.y);
+  await page.waitForFunction(() => engine.hovered?.id === 'restored-emoji');
+  await page.mouse.move(point.x, point.y + 100);
+  await page.waitForFunction(() => !engine.hovered);
+  assert.equal(await page.evaluate(() => engine.active[0].time), 55);
+});
+
+test('playing seek survives native restart and restored comments continue without duplicate entry', async () => {
+  await page.evaluate(() => {
+    seed([comment('restored', { start: 55000 }), comment('next', { start: 61000 })]);
+    media.paused = false; engine.play();
+    media.currentTime = 60; media.seeking = true; media.dispatchEvent(new Event('seeking'));
+    engine.main.data = []; engine.stop();
+    media.seeking = false; media.dispatchEvent(new Event('seeked'));
+    engine.clear(); engine.stop(); engine.start();
+  });
+  await page.waitForFunction(() => !engine.seekTask && engine.active.some(c => c.id === 'restored'));
+  const result = await page.evaluate(() => {
+    const restored = engine.active.find(c => c.id === 'restored');
+    const before = restored.x;
+    const running = engine.renderer.entries.get(restored).animation.playState;
+    engine.updateComments([comment('restored', { start: 55000 })], false);
+    advance(62);
+    const after = restored.x;
+    const ids = engine.active.map(c => c.id);
+    advance(70);
+    return { before, after, running, ids, expired: !engine.active.some(c => c.id === 'restored') };
+  });
+  assert.equal(result.running, 'running'); assert.ok(result.after < result.before);
+  assert.deepEqual(result.ids, ['restored', 'next']); assert.ok(result.expired);
+});

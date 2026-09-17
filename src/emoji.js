@@ -60,10 +60,9 @@ export function formatDiggCount(value) {
   return count > 9999 ? `${(count / 1e4).toFixed(1)}\u4e07` : String(count);
 }
 
-export function drawRichSprite(parts, style, fontSize, images, channelSize, decorations = {}) {
-  const dpr = window.devicePixelRatio || 1;
-  const canvas = document.createElement('canvas');
-  const ctx = canvas.getContext('2d');
+let measurementContext;
+export function measureRichSprite(parts, style, fontSize, images, channelSize, decorations = {}) {
+  const ctx = measurementContext ||= document.createElement('canvas').getContext('2d');
   ctx.font = style.font;
   const size = fontSize;
   const measured = parts.map(part => {
@@ -76,6 +75,15 @@ export function drawRichSprite(parts, style, fontSize, images, channelSize, deco
   const badgeWidth = badge ? 12 + iconSize + (count ? 6 + ctx.measureText(count).width : 0) : 0;
   const width = Math.max(1, Math.ceil(measured.reduce((sum, part) => sum + part.width, 0) + badgeWidth) + 34);
   const height = Math.ceil(Math.max(size + 4, channelSize));
+  return { measured, badge, count, iconSize, width, height };
+}
+
+export function drawRichSprite(parts, style, fontSize, images, channelSize, decorations = {}) {
+  const { measured, badge, count, iconSize, width, height } = measureRichSprite(parts, style, fontSize, images, channelSize, decorations);
+  const dpr = window.devicePixelRatio || 1;
+  const canvas = document.createElement('canvas');
+  const ctx = canvas.getContext('2d');
+  const size = fontSize;
   canvas.width = width * dpr;
   canvas.height = height * dpr;
   ctx.scale(dpr, dpr);

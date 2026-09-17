@@ -15,6 +15,7 @@ export class Timeline {
     this.items = [];
     this.ids = new Map();
     this.serial = 0;
+    this.maxDuration = 0;
   }
   update(comments, replace, now) {
     if (replace) this.clear();
@@ -27,6 +28,7 @@ export class Timeline {
       if (!Number.isFinite(start)) continue;
       const item = { id, time: Math.max(0, start), text, raw };
       this.ids.set(id, item);
+      if (Number.isFinite(Number(raw.duration))) this.maxDuration = Math.max(this.maxDuration, Number(raw.duration));
     }
     this.items = [...this.ids.values()].sort((a, b) => a.time - b.time);
   }

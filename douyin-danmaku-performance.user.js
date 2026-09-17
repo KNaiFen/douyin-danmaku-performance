@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         抖音弹幕 Canvas 性能优化
 // @namespace    local.douyin-danmaku-performance
-// @version      0.3.1
+// @version      0.3.2
 // @description  保留弹幕内容，替换 DOM 弹幕引擎，优化播放与进度跳转。
 // @match        https://www.douyin.com/*
 // @run-at       document-start
@@ -261,6 +261,7 @@ SOFTWARE.
       this.items = [];
       this.ids = /* @__PURE__ */ new Map();
       this.serial = 0;
+      this.maxDuration = 0;
     }
     update(comments, replace, now2) {
       if (replace) this.clear();
@@ -273,6 +274,7 @@ SOFTWARE.
         if (!Number.isFinite(start)) continue;
         const item = { id, time: Math.max(0, start), text, raw };
         this.ids.set(id, item);
+        if (Number.isFinite(Number(raw.duration))) this.maxDuration = Math.max(this.maxDuration, Number(raw.duration));
       }
       this.items = [...this.ids.values()].sort((a, b) => a.time - b.time);
     }
@@ -354,10 +356,9 @@ SOFTWARE.
     const count = Math.max(0, Number(value) || 0);
     return count > 9999 ? `${(count / 1e4).toFixed(1)}\u4E07` : String(count);
   }
-  function drawRichSprite(parts, style, fontSize, images, channelSize, decorations = {}) {
-    const dpr2 = window.devicePixelRatio || 1;
-    const canvas = document.createElement("canvas");
-    const ctx = canvas.getContext("2d");
+  var measurementContext;
+  function measureRichSprite(parts, style, fontSize, images, channelSize, decorations = {}) {
+    const ctx = measurementContext ||= document.createElement("canvas").getContext("2d");
     ctx.font = style.font;
     const size = fontSize;
     const measured = parts.map((part) => {
@@ -370,6 +371,14 @@ SOFTWARE.
     const badgeWidth = badge ? 12 + iconSize + (count ? 6 + ctx.measureText(count).width : 0) : 0;
     const width = Math.max(1, Math.ceil(measured.reduce((sum, part) => sum + part.width, 0) + badgeWidth) + 34);
     const height = Math.ceil(Math.max(size + 4, channelSize));
+    return { measured, badge, count, iconSize, width, height };
+  }
+  function drawRichSprite(parts, style, fontSize, images, channelSize, decorations = {}) {
+    const { measured, badge, count, iconSize, width, height } = measureRichSprite(parts, style, fontSize, images, channelSize, decorations);
+    const dpr2 = window.devicePixelRatio || 1;
+    const canvas = document.createElement("canvas");
+    const ctx = canvas.getContext("2d");
+    const size = fontSize;
     canvas.width = width * dpr2;
     canvas.height = height * dpr2;
     ctx.scale(dpr2, dpr2);
@@ -522,6 +531,8 @@ SOFTWARE.
       this.active = [];
       this.pending = [];
       this.pendingHead = 0;
+      this.restoreQueue = [];
+      this.restoreHead = 0;
       this.emitted = /* @__PURE__ */ new Set();
       this.spriteCache = /* @__PURE__ */ new Map();
       this.cacheBytes = 0;
@@ -574,14 +585,25 @@ SOFTWARE.
         channel: { get: () => ({ containerWidth: this.width, containerHeight: this.height, width: this.width, height: this.height }) }
       });
       this.bind(this.video, "seeking", () => {
-        this.resetFrame();
+        this.beginSeek();
+        this.resetFrame(true);
         this.metrics.seeks++;
         this.cancel();
       });
       this.bind(this.video, "seeked", () => {
         this.buffering = false;
-        this.resetFrame();
-        this.wake();
+        this.resetFrame(true);
+        clearTimeout(this.seekTask);
+        this.seekTask = setTimeout(() => {
+          this.seekTask = 0;
+          this.seekCycle = false;
+          if (this.seekResume && this._status === "closed") this._status = this.video.paused ? "paused" : "playing";
+          this.seekResume = null;
+          if (this._status !== "closed") {
+            this.frame();
+            this.wake(true);
+          }
+        }, 0);
       });
       this.bind(this.video, "play", () => {
         if (this._status === "paused") this._status = "playing";
@@ -603,6 +625,10 @@ SOFTWARE.
       });
       this.bind(this.video, "ended", () => this.cancel());
       this.bind(this.video, "emptied", () => {
+        clearTimeout(this.seekTask);
+        this.seekTask = 0;
+        this.seekCycle = false;
+        this.seekResume = null;
         this.buffering = false;
         this.clear();
       });
@@ -682,6 +708,18 @@ SOFTWARE.
     now() {
       return Number(this.video.currentTime) || 0;
     }
+    beginSeek() {
+      if (this.seekResume == null) this.seekResume = this._status !== "closed";
+      this.seekCycle = true;
+      clearTimeout(this.seekTask);
+      this.seekTask = 0;
+    }
+    restoreWindow() {
+      return Math.max(this.duration, this.mediaDuration(this.timeline.maxDuration), ...this.durationOverrides.values());
+    }
+    hasRestoreWork() {
+      return this.restoreTime != null && (this.restoreHead < this.restoreQueue.length || this.timeline.items[this.position]?.time <= this.now());
+    }
     cancel() {
       cancelAnimationFrame(this.raf);
       clearTimeout(this.timer);
@@ -694,7 +732,8 @@ SOFTWARE.
         clearTimeout(this.timer);
         this.timer = 0;
       }
-      if (this.destroyed || this.raf || this.timer || this._status !== "playing" || this.video.paused || this.video.seeking || this.buffering || document.hidden || !this.inView || !this.width || !this.height) return;
+      const restoring = this.hasRestoreWork();
+      if (this.destroyed || this.raf || this.timer || this._status === "closed" || !restoring && (this._status !== "playing" || this.video.paused) || this.video.seeking || this.buffering || document.hidden || !this.inView || !this.width || !this.height) return;
       const tick = () => {
         this.raf = 0;
         this.timer = 0;
@@ -704,8 +743,8 @@ SOFTWARE.
       };
       if (this.renderer) {
         const nextTime = this.timeline.items[this.position]?.time ?? Infinity;
-        const idle = !this.active.length && this.pendingHead === this.pending.length;
-        const delay = idle ? Math.min(1e3, Math.max(32, (nextTime - this.now()) * 1e3 / (this.video.playbackRate || 1))) : 32;
+        const idle = !restoring && !this.active.length && this.pendingHead === this.pending.length;
+        const delay = restoring ? 4 : idle ? Math.min(1e3, Math.max(32, (nextTime - this.now()) * 1e3 / (this.video.playbackRate || 1))) : 32;
         this.timer = setTimeout(tick, immediate ? 0 : delay);
       } else this.raf = requestAnimationFrame(tick);
     }
@@ -727,23 +766,28 @@ SOFTWARE.
       this.draw();
     }
     stop() {
+      if (this.video.seeking) this.beginSeek();
       this._status = "closed";
       this.cancel();
       this.resetFrame();
     }
     clear() {
-      this.timeline.clear();
+      if (this.video.seeking) this.beginSeek();
+      if (!this.seekCycle) this.timeline.clear();
       this.resetFrame();
     }
-    resetFrame() {
+    resetFrame(restore = this.seekCycle || this.video.seeking) {
       this.releaseHover(false);
       this.active = [];
       this.pending = [];
       this.pendingHead = 0;
+      this.restoreQueue = [];
+      this.restoreHead = 0;
       this.candidate = null;
       this.emitted.clear();
       resetSpace(this.space);
-      this.windowStart = this.now();
+      this.restoreTime = restore ? this.now() : null;
+      this.windowStart = restore ? Math.max(0, this.now() - this.restoreWindow()) : this.now();
       this.position = lowerBound(this.timeline.items, this.windowStart);
       this.lastTime = NaN;
       this.renderer?.clear();
@@ -752,18 +796,23 @@ SOFTWARE.
     updateComments(comments, replace = true) {
       if (this.destroyed) return;
       this.metrics.received += comments?.length || 0;
+      if (this.video.seeking) this.beginSeek();
+      if (this.seekCycle && replace && !comments?.length) return;
       const nextTime = replace ? Infinity : this.timeline.items[this.position]?.time ?? Infinity;
       this.timeline.update(comments, replace, this.now());
       this.candidate = null;
       if (replace) {
         this.pending = [];
         this.pendingHead = 0;
+        this.restoreQueue = [];
+        this.restoreHead = 0;
       }
-      this.position = lowerBound(this.timeline.items, Math.max(this.windowStart, Math.min(nextTime, this.now() - 2)));
+      if (this.restoreTime != null) this.windowStart = Math.max(0, this.restoreTime - this.restoreWindow());
+      this.position = lowerBound(this.timeline.items, Math.max(this.windowStart, this.restoreTime != null ? this.now() - this.restoreWindow() : Math.min(nextTime, this.now() - 2)));
       for (const raw of comments || []) {
         const item = this.timeline.ids.get(String(raw?.id));
         if (!item) continue;
-        if ((item.raw.prior || item.raw.realTime) && item.time <= this.now() && !this.emitted.has(item.id)) {
+        if ((item.raw.prior || item.raw.realTime) && !(this.restoreTime != null && item.time < this.restoreTime && !item.raw.realTime) && item.time <= this.now() && !this.emitted.has(item.id)) {
           this.emitted.add(item.id);
           this.pending.splice(this.pendingHead, 0, item);
         }
@@ -787,6 +836,8 @@ SOFTWARE.
       this.active = this.active.filter((c) => c.id !== String(id));
       this.pending = this.pending.slice(this.pendingHead).filter((c) => c.id !== String(id));
       this.pendingHead = 0;
+      this.restoreQueue = this.restoreQueue.slice(this.restoreHead).filter((c) => c.id !== String(id));
+      this.restoreHead = 0;
       if (this.hovered?.id === String(id)) this.releaseHover(false);
       this.position = lowerBound(this.timeline.items, Math.max(this.windowStart, Math.min(nextTime, this.now() - 2)));
       this.rebuildSpace();
@@ -797,7 +848,7 @@ SOFTWARE.
       const local = this.active.find((c) => c.id === String(oldID));
       this.timeline.rename(oldID, newID);
       if (this.emitted.delete(String(oldID))) this.emitted.add(String(newID));
-      for (const c of [...this.active, ...this.pending.slice(this.pendingHead)]) if (c.id === String(oldID)) {
+      for (const c of [...this.active, ...this.pending.slice(this.pendingHead), ...this.restoreQueue.slice(this.restoreHead)]) if (c.id === String(oldID)) {
         c.id = String(newID);
         c.raw.id = newID;
         if (c.el) {
@@ -816,6 +867,12 @@ SOFTWARE.
         return true;
       });
       this.pendingHead = 0;
+      this.restoreQueue = this.restoreQueue.slice(this.restoreHead).filter((c) => {
+        if (queued.has(c.id)) return false;
+        queued.add(c.id);
+        return true;
+      });
+      this.restoreHead = 0;
       this.candidate = null;
       this.position = lowerBound(this.timeline.items, Math.max(this.windowStart, Math.min(nextTime, this.now() - 2)));
       if (this.freezeId === String(oldID)) this.freezeId = String(newID);
@@ -840,6 +897,7 @@ SOFTWARE.
       const item = this.timeline.ids.get(String(id));
       if (!item || !(Number(duration) > 0)) return;
       item.raw.duration = duration;
+      this.timeline.maxDuration = Math.max(this.timeline.maxDuration, Number(duration));
       for (const c of this.active) if (c.id === String(id)) this.retime(c, this.mediaDuration(duration));
       this.rebuildSpace();
       this.draw();
@@ -924,7 +982,7 @@ SOFTWARE.
       this.emit("channel_resize");
       this.wake();
     }
-    sprite(item) {
+    sprite(item, measureOnly = false) {
       const style = item.raw.style || {};
       const fontSize = this.fontSize;
       const text = item.text;
@@ -939,6 +997,10 @@ SOFTWARE.
         return cached;
       }
       const style2d = { font: `400 ${fontSize}px "PingFang SC", "Microsoft YaHei", sans-serif`, fillStyle: style.color || "#fff", strokeStyle: "#000", lineWidth: 2, textBaseline: "middle" };
+      if (measureOnly) {
+        const { width, height } = measureRichSprite(parts, style2d, fontSize, this.emojiImages, this.channelSize, decorations);
+        return { width, height, fontSize };
+      }
       cached = { ...drawRichSprite(parts, style2d, fontSize, this.emojiImages, this.channelSize, decorations), fontSize };
       this.metrics.spriteBuilds++;
       if (rich) this.metrics.emojiSprites++;
@@ -1036,7 +1098,7 @@ SOFTWARE.
       const begin = performance.now();
       const deadline = begin + 4;
       const time = this.now();
-      if (Number.isFinite(this.lastTime) && time < this.lastTime) this.resetFrame();
+      if (Number.isFinite(this.lastTime) && time < this.lastTime) this.resetFrame(true);
       this.lastTime = time;
       this.active = this.active.filter((c) => {
         if (c.frozenProgress != null || this.progress(c, time) <= 1) return true;
@@ -1055,7 +1117,38 @@ SOFTWARE.
         if (this.emitted.has(item.id)) continue;
         this.emitted.add(item.id);
         if (this.isHidden(item)) continue;
-        this.pending.push(item);
+        if (this.restoreTime != null && item.time < this.restoreTime && !item.raw.realTime) this.restoreQueue.push(item);
+        else this.pending.push(item);
+      }
+      if (this.restoreHead < this.restoreQueue.length) this.rebuildSpace();
+      while (this.restoreHead < this.restoreQueue.length) {
+        if (performance.now() >= deadline) {
+          this.metrics.budgetYields++;
+          break;
+        }
+        const item = this.restoreQueue[this.restoreHead++];
+        const mode = item.raw.mode || "scroll";
+        const duration = this.durationOverrides.get(mode) || (item.raw.duration ? this.mediaDuration(item.raw.duration) : this.duration);
+        if (this.isHidden(item) || item.time + duration <= time) continue;
+        const c = { ...item, ...this.sprite(item, true), duration, mode: mode === "scroll" ? this.config.direction === "l2r" ? "ltr" : "rtl" : mode };
+        if (!["rtl", "ltr", "top", "bottom"].includes(c.mode)) c.mode = "rtl";
+        const oldSpace = this.space[c.mode].slice();
+        c.y = allocate_default.call({ media: { currentTime: c.time, playbackRate: 1 }, _: { width: this.width, height: 1e9, duration: c.duration, space: this.space } }, c);
+        if (c.mode === "bottom") c.y = 1e9 - c.height - c.y;
+        const fits = this.renderHeight && c.y + c.height <= this.renderHeight;
+        if (c.mode === "bottom") c.y = this.renderHeight - c.height - c.y;
+        if (fits && !this.overlapsDuringFlight(c, this.active, time)) {
+          Object.assign(c, this.sprite(item));
+          this.active.push(c);
+          this.emit("bullet_start", c);
+        } else {
+          this.space[c.mode] = oldSpace;
+          this.pending.push(item);
+        }
+      }
+      if (this.restoreHead === this.restoreQueue.length) {
+        this.restoreQueue = [];
+        this.restoreHead = 0;
       }
       while (this.pendingHead < this.pending.length) {
         if (performance.now() >= deadline) {
@@ -1249,6 +1342,8 @@ SOFTWARE.
     }
     destroy() {
       if (this.destroyed) return;
+      clearTimeout(this.seekTask);
+      this.seekTask = 0;
       this.stop();
       this.destroyed = true;
       this.emit("destroy");
@@ -1345,7 +1440,7 @@ SOFTWARE.
   }
 
   // package.json
-  var version = "0.3.1";
+  var version = "0.3.2";
 
   // src/userscript.js
   var diagnostics = { version, modules: [], replaced: 0, fallbacks: 0, incompatible: 0 };

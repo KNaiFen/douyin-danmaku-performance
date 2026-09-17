@@ -2,7 +2,7 @@ import allocate from 'danmaku/src/internal/allocate.js';
 import canvasEngine from 'danmaku/src/engine/canvas.js';
 import { resetSpace } from 'danmaku/src/utils.js';
 import { Timeline, lowerBound } from './timeline.js';
-import { splitEmoji, EmojiImages, drawRichSprite } from './emoji.js';
+import { splitEmoji, EmojiImages, drawRichSprite, measureRichSprite } from './emoji.js';
 import { SpriteRenderer } from './renderer.js';
 
 export const instances = new Set();
@@ -23,6 +23,8 @@ export class CanvasDanmu {
     this.active = [];
     this.pending = [];
     this.pendingHead = 0;
+    this.restoreQueue = [];
+    this.restoreHead = 0;
     this.emitted = new Set();
     this.spriteCache = new Map();
     this.cacheBytes = 0;
@@ -72,15 +74,31 @@ export class CanvasDanmu {
       status: { get: () => this._status },
       channel: { get: () => ({ containerWidth: this.width, containerHeight: this.height, width: this.width, height: this.height }) },
     });
-    this.bind(this.video, 'seeking', () => { this.resetFrame(); this.metrics.seeks++; this.cancel(); });
-    this.bind(this.video, 'seeked', () => { this.buffering = false; this.resetFrame(); this.wake(); });
+    this.bind(this.video, 'seeking', () => { this.beginSeek(); this.resetFrame(true); this.metrics.seeks++; this.cancel(); });
+    this.bind(this.video, 'seeked', () => {
+      this.buffering = false;
+      this.resetFrame(true);
+      clearTimeout(this.seekTask);
+      // The native player synchronously calls clear/stop/start from SEEKED.
+      // Restore after that lifecycle has settled, including when it stays paused.
+      this.seekTask = setTimeout(() => {
+        this.seekTask = 0;
+        this.seekCycle = false;
+        if (this.seekResume && this._status === 'closed') this._status = this.video.paused ? 'paused' : 'playing';
+        this.seekResume = null;
+        if (this._status !== 'closed') { this.frame(); this.wake(true); }
+      }, 0);
+    });
     this.bind(this.video, 'play', () => { if (this._status === 'paused') this._status = 'playing'; this.draw(); this.wake(true); });
     this.bind(this.video, 'playing', () => { this.buffering = false; this.wake(); });
     this.bind(this.video, 'canplay', () => { this.buffering = false; this.wake(); });
     this.bind(this.video, 'pause', () => this.pause());
     this.bind(this.video, 'waiting', () => { this.buffering = true; this.cancel(); });
     this.bind(this.video, 'ended', () => this.cancel());
-    this.bind(this.video, 'emptied', () => { this.buffering = false; this.clear(); });
+    this.bind(this.video, 'emptied', () => {
+      clearTimeout(this.seekTask); this.seekTask = 0; this.seekCycle = false; this.seekResume = null;
+      this.buffering = false; this.clear();
+    });
     this.bind(this.video, 'ratechange', () => { this.draw(); this.wake(true); });
     this.bind(document, 'visibilitychange', () => {
       if (document.hidden) this.cancel();
@@ -129,10 +147,22 @@ export class CanvasDanmu {
   get state() { return { status: this.status, comments: this.main.data, bullets: this.active, displayArea: { width: this.width, height: this.height } }; }
   get containerPos() { return this.container.getBoundingClientRect(); }
   now() { return Number(this.video.currentTime) || 0; }
+  beginSeek() {
+    if (this.seekResume == null) this.seekResume = this._status !== 'closed';
+    this.seekCycle = true;
+    clearTimeout(this.seekTask); this.seekTask = 0;
+  }
+  restoreWindow() {
+    return Math.max(this.duration, this.mediaDuration(this.timeline.maxDuration), ...this.durationOverrides.values());
+  }
+  hasRestoreWork() {
+    return this.restoreTime != null && (this.restoreHead < this.restoreQueue.length || this.timeline.items[this.position]?.time <= this.now());
+  }
   cancel() { cancelAnimationFrame(this.raf); clearTimeout(this.timer); this.raf = 0; this.timer = 0; this.renderer?.pause(); }
   wake(immediate = false) {
     if (immediate) { clearTimeout(this.timer); this.timer = 0; }
-    if (this.destroyed || this.raf || this.timer || this._status !== 'playing' || this.video.paused || this.video.seeking || this.buffering || document.hidden || !this.inView || !this.width || !this.height) return;
+    const restoring = this.hasRestoreWork();
+    if (this.destroyed || this.raf || this.timer || this._status === 'closed' || (!restoring && (this._status !== 'playing' || this.video.paused)) || this.video.seeking || this.buffering || document.hidden || !this.inView || !this.width || !this.height) return;
     const tick = () => {
       this.raf = 0; this.timer = 0;
       this.metrics.schedulerCallbacks++;
@@ -141,8 +171,8 @@ export class CanvasDanmu {
     };
     if (this.renderer) {
       const nextTime = this.timeline.items[this.position]?.time ?? Infinity;
-      const idle = !this.active.length && this.pendingHead === this.pending.length;
-      const delay = idle ? Math.min(1000, Math.max(32, (nextTime - this.now()) * 1000 / (this.video.playbackRate || 1))) : 32;
+      const idle = !restoring && !this.active.length && this.pendingHead === this.pending.length;
+      const delay = restoring ? 4 : idle ? Math.min(1000, Math.max(32, (nextTime - this.now()) * 1000 / (this.video.playbackRate || 1))) : 32;
       // Transforms advance independently. Avoid a JS callback at every display refresh.
       this.timer = setTimeout(tick, immediate ? 0 : delay);
     } else this.raf = requestAnimationFrame(tick);
@@ -150,17 +180,27 @@ export class CanvasDanmu {
   start() { if (this.destroyed || this._status === 'playing') return; this._status = 'playing'; this.frame(); this.wake(); }
   play() { if (this.destroyed || this._status === 'closed') return; this._status = 'playing'; this.draw(); this.wake(true); }
   pause() { if (this._status !== 'closed') this._status = 'paused'; this.cancel(); this.draw(); }
-  stop() { this._status = 'closed'; this.cancel(); this.resetFrame(); }
-  clear() { this.timeline.clear(); this.resetFrame(); }
-  resetFrame() {
+  stop() {
+    if (this.video.seeking) this.beginSeek();
+    this._status = 'closed'; this.cancel(); this.resetFrame();
+  }
+  clear() {
+    if (this.video.seeking) this.beginSeek();
+    if (!this.seekCycle) this.timeline.clear();
+    this.resetFrame();
+  }
+  resetFrame(restore = this.seekCycle || this.video.seeking) {
     this.releaseHover(false);
     this.active = [];
     this.pending = [];
     this.pendingHead = 0;
+    this.restoreQueue = [];
+    this.restoreHead = 0;
     this.candidate = null;
     this.emitted.clear();
     resetSpace(this.space);
-    this.windowStart = this.now();
+    this.restoreTime = restore ? this.now() : null;
+    this.windowStart = restore ? Math.max(0, this.now() - this.restoreWindow()) : this.now();
     this.position = lowerBound(this.timeline.items, this.windowStart);
     this.lastTime = NaN;
     this.renderer?.clear();
@@ -169,17 +209,20 @@ export class CanvasDanmu {
   updateComments(comments, replace = true) {
     if (this.destroyed) return;
     this.metrics.received += comments?.length || 0;
+    if (this.video.seeking) this.beginSeek();
+    if (this.seekCycle && replace && !comments?.length) return;
     const nextTime = replace ? Infinity : this.timeline.items[this.position]?.time ?? Infinity;
     this.timeline.update(comments, replace, this.now());
     this.candidate = null;
-    if (replace) { this.pending = []; this.pendingHead = 0; }
-    this.position = lowerBound(this.timeline.items, Math.max(this.windowStart, Math.min(nextTime, this.now() - 2)));
+    if (replace) { this.pending = []; this.pendingHead = 0; this.restoreQueue = []; this.restoreHead = 0; }
+    if (this.restoreTime != null) this.windowStart = Math.max(0, this.restoreTime - this.restoreWindow());
+    this.position = lowerBound(this.timeline.items, Math.max(this.windowStart, this.restoreTime != null ? this.now() - this.restoreWindow() : Math.min(nextTime, this.now() - 2)));
     // Priority and realtime comments must still appear when their server offset
     // predates the current seek window (including comments sent while paused).
     for (const raw of comments || []) {
       const item = this.timeline.ids.get(String(raw?.id));
       if (!item) continue;
-      if ((item.raw.prior || item.raw.realTime) && item.time <= this.now() && !this.emitted.has(item.id)) {
+      if ((item.raw.prior || item.raw.realTime) && !(this.restoreTime != null && item.time < this.restoreTime && !item.raw.realTime) && item.time <= this.now() && !this.emitted.has(item.id)) {
         this.emitted.add(item.id);
         this.pending.splice(this.pendingHead, 0, item);
       }
@@ -201,6 +244,8 @@ export class CanvasDanmu {
     this.active = this.active.filter(c => c.id !== String(id));
     this.pending = this.pending.slice(this.pendingHead).filter(c => c.id !== String(id));
     this.pendingHead = 0;
+    this.restoreQueue = this.restoreQueue.slice(this.restoreHead).filter(c => c.id !== String(id));
+    this.restoreHead = 0;
     if (this.hovered?.id === String(id)) this.releaseHover(false);
     this.position = lowerBound(this.timeline.items, Math.max(this.windowStart, Math.min(nextTime, this.now() - 2)));
     this.rebuildSpace();
@@ -211,7 +256,7 @@ export class CanvasDanmu {
     const local = this.active.find(c => c.id === String(oldID));
     this.timeline.rename(oldID, newID);
     if (this.emitted.delete(String(oldID))) this.emitted.add(String(newID));
-    for (const c of [...this.active, ...this.pending.slice(this.pendingHead)]) if (c.id === String(oldID)) {
+    for (const c of [...this.active, ...this.pending.slice(this.pendingHead), ...this.restoreQueue.slice(this.restoreHead)]) if (c.id === String(oldID)) {
       c.id = String(newID);
       c.raw.id = newID;
       if (c.el) {
@@ -229,6 +274,11 @@ export class CanvasDanmu {
       queued.add(c.id); return true;
     });
     this.pendingHead = 0;
+    this.restoreQueue = this.restoreQueue.slice(this.restoreHead).filter(c => {
+      if (queued.has(c.id)) return false;
+      queued.add(c.id); return true;
+    });
+    this.restoreHead = 0;
     this.candidate = null;
     this.position = lowerBound(this.timeline.items, Math.max(this.windowStart, Math.min(nextTime, this.now() - 2)));
     if (this.freezeId === String(oldID)) this.freezeId = String(newID);
@@ -251,6 +301,7 @@ export class CanvasDanmu {
     const item = this.timeline.ids.get(String(id));
     if (!item || !(Number(duration) > 0)) return;
     item.raw.duration = duration;
+    this.timeline.maxDuration = Math.max(this.timeline.maxDuration, Number(duration));
     for (const c of this.active) if (c.id === String(id)) this.retime(c, this.mediaDuration(duration));
     this.rebuildSpace();
     this.draw();
@@ -318,7 +369,7 @@ export class CanvasDanmu {
     this.wake();
   }
 
-  sprite(item) {
+  sprite(item, measureOnly = false) {
     const style = item.raw.style || {};
     const fontSize = this.fontSize;
     const text = item.text;
@@ -329,6 +380,10 @@ export class CanvasDanmu {
     let cached = this.spriteCache.get(key);
     if (cached) { this.spriteCache.delete(key); this.spriteCache.set(key, cached); return cached; }
     const style2d = { font: `400 ${fontSize}px "PingFang SC", "Microsoft YaHei", sans-serif`, fillStyle: style.color || '#fff', strokeStyle: '#000', lineWidth: 2, textBaseline: 'middle' };
+    if (measureOnly) {
+      const { width, height } = measureRichSprite(parts, style2d, fontSize, this.emojiImages, this.channelSize, decorations);
+      return { width, height, fontSize };
+    }
     cached = { ...drawRichSprite(parts, style2d, fontSize, this.emojiImages, this.channelSize, decorations), fontSize };
     this.metrics.spriteBuilds++;
     if (rich) this.metrics.emojiSprites++;
@@ -422,7 +477,7 @@ export class CanvasDanmu {
     const begin = performance.now();
     const deadline = begin + 4;
     const time = this.now();
-    if (Number.isFinite(this.lastTime) && time < this.lastTime) this.resetFrame();
+    if (Number.isFinite(this.lastTime) && time < this.lastTime) this.resetFrame(true);
     this.lastTime = time;
     this.active = this.active.filter(c => {
       if (c.frozenProgress != null || this.progress(c, time) <= 1) return true;
@@ -438,8 +493,35 @@ export class CanvasDanmu {
       if (this.emitted.has(item.id)) continue;
       this.emitted.add(item.id);
       if (this.isHidden(item)) continue;
-      this.pending.push(item);
+      if (this.restoreTime != null && item.time < this.restoreTime && !item.raw.realTime) this.restoreQueue.push(item);
+      else this.pending.push(item);
     }
+    if (this.restoreHead < this.restoreQueue.length) this.rebuildSpace();
+    while (this.restoreHead < this.restoreQueue.length) {
+      if (performance.now() >= deadline) { this.metrics.budgetYields++; break; }
+      const item = this.restoreQueue[this.restoreHead++];
+      const mode = item.raw.mode || 'scroll';
+      const duration = this.durationOverrides.get(mode) || (item.raw.duration ? this.mediaDuration(item.raw.duration) : this.duration);
+      // A seek reconstructs only comments still alive at the new media time;
+      // it must never replay the old position's backlog or expired history.
+      if (this.isHidden(item) || item.time + duration <= time) continue;
+      const c = { ...item, ...this.sprite(item, true), duration, mode: mode === 'scroll' ? (this.config.direction === 'l2r' ? 'ltr' : 'rtl') : mode };
+      if (!['rtl', 'ltr', 'top', 'bottom'].includes(c.mode)) c.mode = 'rtl';
+      const oldSpace = this.space[c.mode].slice();
+      c.y = allocate.call({ media: { currentTime: c.time, playbackRate: 1 }, _: { width: this.width, height: 1e9, duration: c.duration, space: this.space } }, c);
+      if (c.mode === 'bottom') c.y = 1e9 - c.height - c.y;
+      const fits = this.renderHeight && c.y + c.height <= this.renderHeight;
+      if (c.mode === 'bottom') c.y = this.renderHeight - c.height - c.y;
+      if (fits && !this.overlapsDuringFlight(c, this.active, time)) {
+        Object.assign(c, this.sprite(item));
+        this.active.push(c);
+        this.emit('bullet_start', c);
+      } else {
+        this.space[c.mode] = oldSpace;
+        this.pending.push(item);
+      }
+    }
+    if (this.restoreHead === this.restoreQueue.length) { this.restoreQueue = []; this.restoreHead = 0; }
     while (this.pendingHead < this.pending.length) {
       if (performance.now() >= deadline) { this.metrics.budgetYields++; break; }
       const item = this.pending[this.pendingHead];
@@ -614,6 +696,7 @@ export class CanvasDanmu {
   }
   destroy() {
     if (this.destroyed) return;
+    clearTimeout(this.seekTask); this.seekTask = 0;
     this.stop();
     this.destroyed = true;
     this.emit('destroy');
