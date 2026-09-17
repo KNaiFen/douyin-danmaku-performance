@@ -468,6 +468,76 @@ test('compositor pauses on buffering, restarts, follows rate and releases every 
   assert.equal(result.rate, 2); assert.equal(result.animations, 0); assert.equal(result.sprites, 0);
 });
 
+test('buffer recovery resumes a native-paused engine without another play event', async () => {
+  await page.evaluate(() => {
+    seed([comment('recover')]); advance(2);
+    media.paused = false; engine.play();
+    media.dispatchEvent(new Event('waiting'));
+    engine.pause();
+    media.dispatchEvent(new Event('canplay'));
+    media.dispatchEvent(new Event('playing'));
+  });
+  const result = await page.evaluate(async () => {
+    await new Promise(resolve => setTimeout(resolve, 60));
+    const entry = engine.renderer.entries.get(engine.active[0]);
+    return { status: engine.status, running: entry.animation.playState, scheduled: !!engine.timer };
+  });
+  assert.equal(result.status, 'playing'); assert.equal(result.running, 'running'); assert.ok(result.scheduled);
+});
+
+test('media progress repairs a stale native pause after seek recovery', async () => {
+  await page.evaluate(() => {
+    seed([comment('restored', { start: 55000 }), comment('new', { start: 61000 })]);
+    media.paused = false; engine.play();
+    media.currentTime = 60; media.seeking = true; media.dispatchEvent(new Event('seeking'));
+    engine.stop();
+    media.seeking = false; media.dispatchEvent(new Event('seeked'));
+    engine.start(); media.dispatchEvent(new Event('playing'));
+  });
+  await page.waitForFunction(() => !engine.seekTask && !engine.hasRestoreWork());
+  await page.evaluate(() => {
+    // The site's PAUSE handler uses setTimeout and can run after PLAY/SEEKED.
+    engine.pause();
+    media.currentTime = 62; media.dispatchEvent(new Event('timeupdate'));
+  });
+  const result = await page.evaluate(async () => {
+    await new Promise(resolve => setTimeout(resolve, 60));
+    return { status: engine.status, ids: engine.active.map(c => c.id),
+      running: [...engine.renderer.entries.values()].every(entry => entry.animation.playState === 'running') };
+  });
+  assert.equal(result.status, 'playing'); assert.deepEqual(result.ids, ['restored', 'new']); assert.ok(result.running);
+});
+
+test('recovery media events do not reopen disabled danmaku or unpause a paused video', async () => {
+  const result = await page.evaluate(() => {
+    seed([comment('disabled')]); engine.stop();
+    media.paused = false;
+    for (const name of ['canplay', 'playing', 'timeupdate']) media.dispatchEvent(new Event(name));
+    const closed = engine.status;
+    media.paused = true; engine.start(); engine.pause();
+    for (const name of ['canplay', 'timeupdate']) media.dispatchEvent(new Event(name));
+    return { closed, paused: engine.status, timer: engine.timer };
+  });
+  assert.equal(result.closed, 'closed'); assert.equal(result.paused, 'paused'); assert.equal(result.timer, 0);
+});
+
+test('advancing media can recover a lost buffer-end event but frozen buffer time cannot', async () => {
+  const result = await page.evaluate(async () => {
+    seed([comment('buffered')]); advance(2);
+    media.paused = false; media.readyState = 2; engine.play();
+    media.dispatchEvent(new Event('waiting')); engine.pause();
+    media.dispatchEvent(new Event('timeupdate'));
+    const frozen = engine.status === 'paused' && engine.buffering;
+    media.currentTime = 2.1; media.dispatchEvent(new Event('timeupdate'));
+    const unready = engine.status === 'paused' && engine.buffering;
+    media.readyState = 4; media.currentTime = 2.2; media.dispatchEvent(new Event('timeupdate'));
+    await new Promise(resolve => setTimeout(resolve, 60));
+    return { frozen, unready, resumed: engine.status === 'playing' && !engine.buffering,
+      animation: engine.renderer.entries.get(engine.active[0]).animation.playState };
+  });
+  assert.ok(result.frozen); assert.ok(result.unready); assert.ok(result.resumed); assert.equal(result.animation, 'running');
+});
+
 test('static sprites are not reuploaded on normal animation ticks', async () => {
   const result = await page.evaluate(() => {
     seed(Array.from({ length: 50 }, (_, i) => comment(String(i))));

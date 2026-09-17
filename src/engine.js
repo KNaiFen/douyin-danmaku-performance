@@ -91,10 +91,18 @@ export class CanvasDanmu {
       }, 0);
     });
     this.bind(this.video, 'play', () => { if (this._status === 'paused') this._status = 'playing'; this.draw(); this.wake(true); });
-    this.bind(this.video, 'playing', () => { this.buffering = false; this.wake(); });
-    this.bind(this.video, 'canplay', () => { this.buffering = false; this.wake(); });
+    this.bind(this.video, 'playing', () => this.resumeFromMedia());
+    this.bind(this.video, 'canplay', () => this.resumeFromMedia());
+    this.bind(this.video, 'timeupdate', () => {
+      const time = this.now();
+      const advanced = time > this.lastMediaTime;
+      this.lastMediaTime = time;
+      // The site's deferred PAUSE callback can arrive after playback resumes.
+      // Repair only when the media actually advances, without a polling timer.
+      if (advanced && (this.buffering || this._status === 'paused') && (this.video.readyState == null || this.video.readyState >= 3)) this.resumeFromMedia();
+    });
     this.bind(this.video, 'pause', () => this.pause());
-    this.bind(this.video, 'waiting', () => { this.buffering = true; this.cancel(); });
+    this.bind(this.video, 'waiting', () => { this.lastMediaTime = this.now(); this.buffering = true; this.cancel(); });
     this.bind(this.video, 'ended', () => this.cancel());
     this.bind(this.video, 'emptied', () => {
       clearTimeout(this.seekTask); this.seekTask = 0; this.seekCycle = false; this.seekResume = null;
@@ -149,6 +157,13 @@ export class CanvasDanmu {
   get state() { return { status: this.status, comments: this.main.data, bullets: this.active, displayArea: { width: this.width, height: this.height } }; }
   get containerPos() { return this.container.getBoundingClientRect(); }
   now() { return Number(this.video.currentTime) || 0; }
+  resumeFromMedia() {
+    this.buffering = false;
+    if (this.destroyed || this._status === 'closed' || this.video.seeking || this.seekCycle) return;
+    if (!this.video.paused && !this.video.ended) this._status = 'playing';
+    this.draw();
+    this.wake(true);
+  }
   beginSeek() {
     if (this.seekResume == null) this.seekResume = this._status !== 'closed';
     this.seekCycle = true;
@@ -200,7 +215,7 @@ export class CanvasDanmu {
   }
   start() { if (this.destroyed || this._status === 'playing') return; this._status = 'playing'; this.frame(); this.wake(); }
   play() { if (this.destroyed || this._status === 'closed') return; this._status = 'playing'; this.draw(); this.wake(true); }
-  pause() { if (this._status !== 'closed') this._status = 'paused'; this.cancel(); this.draw(); this.wake(); }
+  pause() { this.lastMediaTime = this.now(); if (this._status !== 'closed') this._status = 'paused'; this.cancel(); this.draw(); this.wake(); }
   stop() {
     if (this.video.seeking) this.beginSeek();
     this._status = 'closed'; this.cancel(); this.resetFrame();

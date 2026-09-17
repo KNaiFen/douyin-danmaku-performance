@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         抖音弹幕 Canvas 性能优化
 // @namespace    local.douyin-danmaku-performance
-// @version      0.3.5
+// @version      0.3.6
 // @description  保留弹幕内容，替换 DOM 弹幕引擎，优化播放与进度跳转。
 // @match        https://www.douyin.com/*
 // @run-at       document-start
@@ -629,16 +629,17 @@ SOFTWARE.
         this.draw();
         this.wake(true);
       });
-      this.bind(this.video, "playing", () => {
-        this.buffering = false;
-        this.wake();
-      });
-      this.bind(this.video, "canplay", () => {
-        this.buffering = false;
-        this.wake();
+      this.bind(this.video, "playing", () => this.resumeFromMedia());
+      this.bind(this.video, "canplay", () => this.resumeFromMedia());
+      this.bind(this.video, "timeupdate", () => {
+        const time = this.now();
+        const advanced = time > this.lastMediaTime;
+        this.lastMediaTime = time;
+        if (advanced && (this.buffering || this._status === "paused") && (this.video.readyState == null || this.video.readyState >= 3)) this.resumeFromMedia();
       });
       this.bind(this.video, "pause", () => this.pause());
       this.bind(this.video, "waiting", () => {
+        this.lastMediaTime = this.now();
         this.buffering = true;
         this.cancel();
       });
@@ -728,6 +729,13 @@ SOFTWARE.
     now() {
       return Number(this.video.currentTime) || 0;
     }
+    resumeFromMedia() {
+      this.buffering = false;
+      if (this.destroyed || this._status === "closed" || this.video.seeking || this.seekCycle) return;
+      if (!this.video.paused && !this.video.ended) this._status = "playing";
+      this.draw();
+      this.wake(true);
+    }
     beginSeek() {
       if (this.seekResume == null) this.seekResume = this._status !== "closed";
       this.seekCycle = true;
@@ -795,6 +803,7 @@ SOFTWARE.
       this.wake(true);
     }
     pause() {
+      this.lastMediaTime = this.now();
       if (this._status !== "closed") this._status = "paused";
       this.cancel();
       this.draw();
@@ -1519,7 +1528,7 @@ SOFTWARE.
   }
 
   // package.json
-  var version = "0.3.5";
+  var version = "0.3.6";
 
   // src/userscript.js
   var diagnostics = { version, modules: [], replaced: 0, fallbacks: 0, incompatible: 0 };
